@@ -1,0 +1,511 @@
+name: Build Android App (AAB & APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'Android versionCode (must be strictly higher than previous release for in-place updates)'
+        required: false
+        default: ''
+      version_name:
+        description: 'Android versionName (e.g., 1.1.0)'
+        required: false
+        default: ''
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '24'
+  JAVA_VERSION: '21'
+
+jobs:
+  build:
+    name: Build Android App Bundle & APK
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Reclaim Artifact Quota (Early Cleanup of Old Artifacts)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              });
+
+              const otherArtifacts = artifacts.filter(
+                (a) => !a.workflow_run || Number(a.workflow_run.id) !== Number(context.runId)
+              );
+
+              const totalBytes = otherArtifacts.reduce((sum, a) => sum + (a.size_in_bytes || 0), 0);
+              core.info(`Found ${otherArtifacts.length} existing artifact(s) using ${(totalBytes / (1024 * 1024)).toFixed(2)} MB.`);
+
+              // Sort newest first; keep at most the newest 2 artifacts (1 run) only if total < 100 MB,
+              // otherwise purge all prior artifacts early so GitHub refreshes storage quota before upload.
+              otherArtifacts.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              const toDelete = totalBytes > 100 * 1024 * 1024 ? otherArtifacts : otherArtifacts.slice(2);
+
+              for (const artifact of toDelete) {
+                try {
+                  await github.rest.actions.deleteArtifact({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    artifact_id: artifact.id,
+                  });
+                  core.info(`Deleted old artifact "${artifact.name}" (id=${artifact.id}, ${(artifact.size_in_bytes / (1024 * 1024)).toFixed(2)} MB)`);
+                } catch (err) {
+                  core.warning(`Failed to delete artifact ${artifact.id}: ${err.message}`);
+                }
+              }
+            } catch (err) {
+              core.warning(`Early artifact cleanup notice: ${err.message}`);
+            }
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'cmdline-tools;latest platform-tools platforms;android-36 platforms;android-35 build-tools;36.0.0 build-tools;35.0.0'
+
+      - name: Accept Android SDK Licenses & Verify SDK Platform 36
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses"
+          SDKMANAGER_BIN=""
+          if command -v sdkmanager &> /dev/null; then
+            SDKMANAGER_BIN="sdkmanager"
+          elif [ -f "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER_BIN="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          fi
+
+          if [ -n "$SDKMANAGER_BIN" ]; then
+            yes | "$SDKMANAGER_BIN" --licenses > /dev/null 2>&1 || true
+            yes | "$SDKMANAGER_BIN" "platforms;android-36" "build-tools;36.0.0" > /dev/null 2>&1 || true
+          fi
+
+          if [ ! -f "$ANDROID_HOME/platforms/android-36/android.jar" ]; then
+            echo "::error::Android SDK Platform 36 (android.jar) not found!"
+            ls -la "$ANDROID_HOME/platforms" || true
+            exit 1
+          fi
+          echo "Verified Android SDK Platform 36 at $ANDROID_HOME/platforms/android-36/android.jar"
+
+      - name: Configure Android SDK Local Properties
+        run: |
+          mkdir -p android
+          echo "sdk.dir=${ANDROID_HOME}" > android/local.properties
+
+      - name: Setup Gradle Build Environment
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+          cache-cleanup: on-success
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache npm dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('package-lock.json', 'package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+
+      - name: Install Node.js dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund --legacy-peer-deps
+          fi
+
+      - name: Resolve Monotonic Android Version Metadata
+        env:
+          INPUT_VERSION_CODE: ${{ github.event.inputs.version_code }}
+          INPUT_VERSION_NAME: ${{ github.event.inputs.version_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          BASE_VC=1
+          BASE_VN="1.0"
+          if [ -f "android/version.properties" ]; then
+            PROP_VC=$(grep -E '^VERSION_CODE=' android/version.properties | head -n 1 | cut -d'=' -f2- | tr -d '[:space:]')
+            PROP_VN=$(grep -E '^VERSION_NAME=' android/version.properties | head -n 1 | cut -d'=' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [[ "$PROP_VC" =~ ^[0-9]+$ ]] && [ "$PROP_VC" -gt 0 ]; then
+              BASE_VC="$PROP_VC"
+            fi
+            if [ -n "$PROP_VN" ]; then
+              BASE_VN="$PROP_VN"
+            fi
+          fi
+
+          CLEAN_INPUT_VC=$(printf '%s' "${INPUT_VERSION_CODE:-}" | tr -d '[:space:]')
+          if [ -n "$CLEAN_INPUT_VC" ]; then
+            if ! [[ "$CLEAN_INPUT_VC" =~ ^[0-9]+$ ]] || [ "$CLEAN_INPUT_VC" -lt 1 ]; then
+              echo "::error::Invalid version_code input '$CLEAN_INPUT_VC'. Must be a positive integer."
+              exit 1
+            fi
+            if [ "$CLEAN_INPUT_VC" -lt "$BASE_VC" ]; then
+              echo "::error::Provided version_code ($CLEAN_INPUT_VC) is lower than base VERSION_CODE ($BASE_VC) in android/version.properties. Downgrading causes 'package conflicts with an existing package'."
+              exit 1
+            fi
+            FINAL_VC="$CLEAN_INPUT_VC"
+          else
+            # Monotonically increase versionCode per CI run so automatic builds never downgrade
+            FINAL_VC=$(( BASE_VC + RUN_NUMBER - 1 ))
+          fi
+
+          CLEAN_INPUT_VN=$(printf '%s' "${INPUT_VERSION_NAME:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          FINAL_VN="${CLEAN_INPUT_VN:-$BASE_VN}"
+
+          echo "ANDROID_VERSION_CODE=$FINAL_VC" >> "$GITHUB_ENV"
+          echo "ANDROID_VERSION_NAME=$FINAL_VN" >> "$GITHUB_ENV"
+          echo "Resolved Android version: versionCode=$FINAL_VC, versionName=$FINAL_VN (base=$BASE_VC, run_number=$RUN_NUMBER)"
+
+      - name: Build Web Application
+        run: |
+          rm -rf dist
+          npm run build
+          if [ ! -d "dist" ] || [ ! -f "dist/index.html" ]; then
+            echo "::error::Web build failed to generate dist/index.html!"
+            exit 1
+          fi
+
+      - name: Restore & Verify Google Services Config & Sync Capacitor
+        env:
+          GOOGLE_SERVICES_JSON_BASE64: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+          GOOGLE_SERVICES_BASE64: ${{ secrets.GOOGLE_SERVICES_BASE64 }}
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          mkdir -p android/app
+
+          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
+            echo "Restoring android/app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret..."
+            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | tr -d '\r\n ' | base64 --decode > android/app/google-services.json
+          elif [ -n "$GOOGLE_SERVICES_BASE64" ]; then
+            echo "Restoring android/app/google-services.json from GOOGLE_SERVICES_BASE64 secret..."
+            printf '%s' "$GOOGLE_SERVICES_BASE64" | tr -d '\r\n ' | base64 --decode > android/app/google-services.json
+          elif [ -n "$GOOGLE_SERVICES_JSON" ]; then
+            echo "Restoring android/app/google-services.json from GOOGLE_SERVICES_JSON secret..."
+            printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          elif [ -s "android/app/google-services.json" ]; then
+            echo "Using repository android/app/google-services.json..."
+          elif [ -s "public/assets/aistudio/google-services__14__37dea63f.json" ]; then
+            echo "Copying verified repository asset to android/app/google-services.json..."
+            cp public/assets/aistudio/google-services__14__37dea63f.json android/app/google-services.json
+          fi
+
+          if [ ! -s "android/app/google-services.json" ]; then
+            echo "::error::android/app/google-services.json is missing or empty! Commit android/app/google-services.json or set GOOGLE_SERVICES_JSON_BASE64 in GitHub Secrets."
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("fs");
+            const gs = JSON.parse(fs.readFileSync("android/app/google-services.json", "utf8"));
+            const projectId = gs?.project_info?.project_id;
+            if (projectId !== "avian-gate-pbcxw") {
+              console.error("::error::google-services.json project_id mismatch! Expected avian-gate-pbcxw, got: " + projectId);
+              process.exit(1);
+            }
+            const clients = Array.isArray(gs?.client) ? gs.client : [];
+            const matchingClient = clients.find(
+              (c) => c?.client_info?.android_client_info?.package_name === "org.alnasr.bloodqatabah"
+            );
+            if (!matchingClient) {
+              console.error("::error::google-services.json has no client with package_name org.alnasr.bloodqatabah!");
+              process.exit(1);
+            }
+            const mobileAppId = matchingClient?.client_info?.mobilesdk_app_id;
+            const apiKey = matchingClient?.api_key?.[0]?.current_key;
+            if (!mobileAppId || !apiKey) {
+              console.error("::error::google-services.json client is missing mobilesdk_app_id or api_key!");
+              process.exit(1);
+            }
+            if (fs.existsSync("firebase-applet-config.json")) {
+              const webCfg = JSON.parse(fs.readFileSync("firebase-applet-config.json", "utf8"));
+              if (webCfg?.projectId && webCfg.projectId !== projectId) {
+                console.error("::error::Firebase projectId mismatch between firebase-applet-config.json (" + webCfg.projectId + ") and google-services.json (" + projectId + ")!");
+                process.exit(1);
+              }
+            }
+            console.log("Verified google-services.json:", { projectId, packageName: "org.alnasr.bloodqatabah", mobileAppId });
+          '
+
+          npx cap sync android
+
+      - name: Verify Fixed Package Identity & Release Signing Policy
+        run: |
+          EXPECTED_PKG="org.alnasr.bloodqatabah"
+          grep -q "applicationId \"$EXPECTED_PKG\"" android/app/build.gradle || { echo "::error::android/app/build.gradle applicationId mismatch"; exit 1; }
+          grep -q "namespace = \"$EXPECTED_PKG\"" android/app/build.gradle || { echo "::error::android/app/build.gradle namespace mismatch"; exit 1; }
+          grep -q "\"appId\": \"$EXPECTED_PKG\"" capacitor.config.json || { echo "::error::capacitor.config.json appId mismatch"; exit 1; }
+          grep -q "appId: '$EXPECTED_PKG'" capacitor.config.ts || { echo "::error::capacitor.config.ts appId mismatch"; exit 1; }
+          grep -q "\"appId\": \"$EXPECTED_PKG\"" android/app/src/main/assets/capacitor.config.json || { echo "::error::android capacitor.config.json appId mismatch"; exit 1; }
+          grep -q "<string name=\"package_name\">$EXPECTED_PKG</string>" android/app/src/main/res/values/strings.xml || { echo "::error::strings.xml package_name mismatch"; exit 1; }
+          if grep -qE "signingConfigs\.debug|debug\.keystore" android/app/build.gradle; then
+            echo "::error::Forbidden debug signing fallback detected in android/app/build.gradle!"
+            exit 1
+          fi
+          echo "Verified fixed package identity ($EXPECTED_PKG) and strict release signing policy."
+
+      - name: Clean Stale Android Build Outputs & Verify Gradlew
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          rm -rf app/build/outputs ../build-artifacts
+          ./gradlew --version
+
+      - name: Verify Mandatory Release Signing Secrets & Pinned Certificate
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          EXPECTED_RELEASE_CERT_SHA256: ${{ secrets.EXPECTED_RELEASE_CERT_SHA256 }}
+        run: |
+          MISSING_SECRETS=""
+          [ -z "$KEYSTORE_BASE64" ] && MISSING_SECRETS="$MISSING_SECRETS KEYSTORE_BASE64"
+          [ -z "$KEYSTORE_PASSWORD" ] && MISSING_SECRETS="$MISSING_SECRETS KEYSTORE_PASSWORD"
+          [ -z "$KEY_ALIAS" ] && MISSING_SECRETS="$MISSING_SECRETS KEY_ALIAS"
+          [ -z "$EXPECTED_RELEASE_CERT_SHA256" ] && MISSING_SECRETS="$MISSING_SECRETS EXPECTED_RELEASE_CERT_SHA256"
+
+          if [ -n "$MISSING_SECRETS" ]; then
+            echo "::error::Release build aborted! Missing required GitHub Secret(s):${MISSING_SECRETS}."
+            echo "::error::Debug keystore fallback and replacement key generation are strictly disabled to prevent INSTALL_FAILED_UPDATE_INCOMPATIBLE."
+            echo "If you need EXPECTED_RELEASE_CERT_SHA256 from the currently installed APK on a phone, run:"
+            echo "  adb shell pm path org.alnasr.bloodqatabah"
+            echo "  adb pull /data/app/.../base.apk old-installed.apk"
+            echo "  apksigner verify --print-certs old-installed.apk"
+            exit 1
+          fi
+
+          NORM_PINNED=$(printf '%s' "$EXPECTED_RELEASE_CERT_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
+          if ! [[ "$NORM_PINNED" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid EXPECTED_RELEASE_CERT_SHA256 format! Expected a 64-character hex SHA-256 fingerprint (with or without colons)."
+            exit 1
+          fi
+
+          EFFECTIVE_KEY_PASSWORD="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > android/app/release.keystore
+          if [ ! -s android/app/release.keystore ]; then
+            echo "::error::Decoded release.keystore is empty or invalid base64!"
+            rm -f android/app/release.keystore
+            exit 1
+          fi
+
+          if ! keytool -list -keystore android/app/release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "::error::Failed to verify release.keystore with provided KEYSTORE_PASSWORD and KEY_ALIAS!"
+            rm -f android/app/release.keystore
+            exit 1
+          fi
+
+          CERT_SHA256=$(keytool -list -v -keystore android/app/release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" 2>/dev/null | grep -iE "SHA256:|SHA-256:" | head -n 1 | sed -E 's/.*SHA-?256:[[:space:]]*//' | tr -d '[:space:]')
+          if [ -z "$CERT_SHA256" ]; then
+            echo "::error::Could not extract SHA-256 certificate fingerprint from release.keystore!"
+            rm -f android/app/release.keystore
+            exit 1
+          fi
+
+          NORM_KEYSTORE=$(printf '%s' "$CERT_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
+          if [ "$NORM_PINNED" != "$NORM_KEYSTORE" ]; then
+            echo "::error::Release keystore SHA-256 ($NORM_KEYSTORE) does not match pinned EXPECTED_RELEASE_CERT_SHA256 ($NORM_PINNED)! Aborting build to prevent INSTALL_FAILED_UPDATE_INCOMPATIBLE."
+            rm -f android/app/release.keystore
+            exit 1
+          fi
+
+          echo "ANDROID_KEYSTORE_FILE=release.keystore" >> "$GITHUB_ENV"
+          echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "ANDROID_KEY_PASSWORD=$EFFECTIVE_KEY_PASSWORD" >> "$GITHUB_ENV"
+          echo "SIGNING_CERT_SHA256=$NORM_KEYSTORE" >> "$GITHUB_ENV"
+          echo "PINNED_CERT_SHA256=$NORM_PINNED" >> "$GITHUB_ENV"
+          echo "Release keystore verified and matched pinned certificate SHA-256: ${NORM_KEYSTORE}"
+
+      - name: Build Signed Android Release AAB & APK
+        working-directory: android
+        run: |
+          ./gradlew bundleRelease assembleRelease --no-daemon --stacktrace
+
+      - name: Verify Release Signature, Package Metadata, AAB Integrity & Stage Deliverables
+        run: |
+          rm -rf build-artifacts
+          mkdir -p build-artifacts/apk build-artifacts/aab
+
+          AAB_FILE=$(find android/app/build/outputs/bundle/release -name "*.aab" -type f | head -n 1)
+          if [ -z "$AAB_FILE" ] || [ ! -s "$AAB_FILE" ]; then
+            echo "::error::Signed Android App Bundle (.aab) was NOT generated!"
+            exit 1
+          fi
+          unzip -tq "$AAB_FILE" > /dev/null
+          if ! unzip -l "$AAB_FILE" | grep -q "base/manifest/AndroidManifest.xml"; then
+            echo "::error::Generated AAB is missing base/manifest/AndroidManifest.xml!"
+            exit 1
+          fi
+          if ! jarsigner -verify "$AAB_FILE" >/dev/null 2>&1; then
+            echo "::error::Generated AAB signature verification failed!"
+            exit 1
+          fi
+
+          AAB_CERT_RAW=$(keytool -printcert -jarfile "$AAB_FILE" 2>/dev/null | grep -iE "SHA256:|SHA-256:" | head -n 1 | sed -E 's/.*SHA-?256:[[:space:]]*//' | tr -d '[:space:]')
+          NORM_AAB_CERT=$(printf '%s' "$AAB_CERT_RAW" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
+          if [ -z "$NORM_AAB_CERT" ] || [ "$NORM_AAB_CERT" != "$PINNED_CERT_SHA256" ]; then
+            echo "::error::AAB certificate mismatch! Expected pinned $PINNED_CERT_SHA256, got '${NORM_AAB_CERT:-empty}'."
+            exit 1
+          fi
+          cp "$AAB_FILE" build-artifacts/aab/blood-qatabah-release.aab
+
+          RELEASE_APK=$(find android/app/build/outputs/apk/release -name "*.apk" ! -name "*-unsigned.apk" -type f | head -n 1)
+          if [ -z "$RELEASE_APK" ] || [ ! -s "$RELEASE_APK" ]; then
+            echo "::error::Signed Release APK was NOT generated! Found files:"
+            ls -la android/app/build/outputs/apk/release || true
+            exit 1
+          fi
+
+          APKSIGNER_BIN=$(find "$ANDROID_HOME/build-tools" -name "apksigner" -type f | sort -V | tail -n 1)
+          if [ -z "$APKSIGNER_BIN" ]; then
+            echo "::error::apksigner not found under ANDROID_HOME/build-tools!"
+            exit 1
+          fi
+
+          echo "Verifying Release APK signature with $APKSIGNER_BIN..."
+          VERIFY_OUTPUT=$("$APKSIGNER_BIN" verify --verbose --print-certs "$RELEASE_APK")
+          echo "$VERIFY_OUTPUT"
+          APK_CERT_SHA256=$(printf '%s\n' "$VERIFY_OUTPUT" | grep -i "Signer #1 certificate SHA-256 digest:" | head -n 1 | awk -F': ' '{print $2}' | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
+          if [ -z "$APK_CERT_SHA256" ]; then
+            echo "::error::Failed to extract Signer #1 SHA-256 certificate digest from Release APK!"
+            exit 1
+          fi
+
+          if [ "$APK_CERT_SHA256" != "$SIGNING_CERT_SHA256" ] || [ "$APK_CERT_SHA256" != "$PINNED_CERT_SHA256" ]; then
+            echo "::error::Release APK certificate mismatch! Expected pinned $PINNED_CERT_SHA256 (keystore $SIGNING_CERT_SHA256), got $APK_CERT_SHA256."
+            exit 1
+          fi
+
+          AAPT2_BIN=$(find "$ANDROID_HOME/build-tools" -name "aapt2" -type f | sort -V | tail -n 1)
+          if [ -n "$AAPT2_BIN" ]; then
+            BADGING=$("$AAPT2_BIN" dump badging "$RELEASE_APK" | head -n 1)
+            echo "APK badging: $BADGING"
+            if ! printf '%s' "$BADGING" | grep -q "name='org.alnasr.bloodqatabah'"; then
+              echo "::error::APK applicationId mismatch! Expected org.alnasr.bloodqatabah, got: $BADGING"
+              exit 1
+            fi
+            if ! printf '%s' "$BADGING" | grep -q "versionCode='${ANDROID_VERSION_CODE}'"; then
+              echo "::error::APK versionCode mismatch! Expected ${ANDROID_VERSION_CODE}, got: $BADGING"
+              exit 1
+            fi
+          fi
+
+          cp "$RELEASE_APK" build-artifacts/apk/app-release.apk
+          APK_SHA256=$(sha256sum build-artifacts/apk/app-release.apk | awk '{print $1}')
+          APK_SIZE=$(stat -c%s build-artifacts/apk/app-release.apk)
+
+          cat << EOF > build-artifacts/apk/update-manifest.json
+          {
+            "packageName": "org.alnasr.bloodqatabah",
+            "apkFileName": "app-release.apk",
+            "versionCode": ${ANDROID_VERSION_CODE},
+            "versionName": "${ANDROID_VERSION_NAME}",
+            "sha256": "${APK_SHA256}",
+            "signingMode": "release",
+            "releaseSigned": true,
+            "signingCertSha256": "${APK_CERT_SHA256}",
+            "fileSize": ${APK_SIZE},
+            "minSdkVersion": 24,
+            "generatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          {
+            echo "## Android Release Build Verified"
+            echo "- **Package Name**: \`org.alnasr.bloodqatabah\`"
+            echo "- **APK File**: \`app-release.apk\`"
+            echo "- **Version**: \`${ANDROID_VERSION_NAME}\` (\`versionCode=${ANDROID_VERSION_CODE}\`)"
+            echo "- **Signing Mode**: \`release\` (Strict Pinned Keystore)"
+            echo "- **Pinned Certificate SHA-256**: \`${APK_CERT_SHA256}\`"
+            echo "- **APK SHA-256**: \`${APK_SHA256}\`"
+            echo "- **In-Place Update Test**: \`adb install -r app-release.apk\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Purge Previous Artifacts Before Upload
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              });
+
+              for (const artifact of artifacts) {
+                if (artifact.workflow_run && Number(artifact.workflow_run.id) === Number(context.runId)) {
+                  continue;
+                }
+                try {
+                  await github.rest.actions.deleteArtifact({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    artifact_id: artifact.id,
+                  });
+                  core.info(`Purged prior artifact "${artifact.name}" (id=${artifact.id})`);
+                } catch (err) {
+                  core.warning(`Could not purge artifact ${artifact.id}: ${err.message}`);
+                }
+              }
+            } catch (err) {
+              core.warning(`Pre-upload artifact purge notice: ${err.message}`);
+            }
+
+      - name: Upload Signed Release APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-APK
+          path: build-artifacts/apk/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+          overwrite: true
+
+      - name: Upload Signed Release AAB Artifact (Google Play Bundle)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-AAB
+          path: build-artifacts/aab/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
+          overwrite: true
+
+      - name: Cleanup Temporary Signing & Build Files
+        if: always()
+        run: |
+          rm -f android/app/release.keystore
+          rm -rf build-artifacts
