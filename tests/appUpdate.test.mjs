@@ -422,6 +422,15 @@ test('Permanent In-Place Update policy locks applicationId, release signing, and
   assert.match(mainApplicationJava, /1:589909705354:android:33008ef0e0b84fd4d0e373/);
   assert.match(workflowYml, /GOOGLE_SERVICES_JSON_BASE64/);
   assert.match(workflowYml, /GOOGLE_SERVICES_BASE64/);
-  assert.match(workflowYml, /base64 --decode > android\/app\/google-services\.json/);
+  assert.match(workflowYml, /Buffer\.from\(b64, "base64"\)/);
   assert.match(workflowYml, /npx cap sync android/);
+  assert.match(workflowYml, /Post-sync check passed: android\/app\/google-services\.json/);
+
+  const rootGitignore = fs.readFileSync(path.resolve('.gitignore'), 'utf8');
+  const androidGitignore = fs.readFileSync(path.resolve('android/.gitignore'), 'utf8');
+  const appGitignore = fs.readFileSync(path.resolve('android/app/.gitignore'), 'utf8');
+  assert.match(rootGitignore, /^!android\/app\/google-services\.json$/m);
+  assert.match(androidGitignore, /^!google-services\.json$/m);
+  assert.match(appGitignore, /^!google-services\.json$/m);
 });
+

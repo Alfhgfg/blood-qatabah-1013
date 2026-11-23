@@ -9,3 +9,5 @@ coverage/
 build-artifacts/
 android/app/release.keystore
 !android/app/google-services.json
+!public/assets/aistudio/google-services__14__37dea63f.json
+

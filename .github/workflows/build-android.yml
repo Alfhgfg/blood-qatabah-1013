@@ -205,30 +205,85 @@ jobs:
         run: |
           mkdir -p android/app
 
-          if [ -n "$GOOGLE_SERVICES_JSON_BASE64" ]; then
-            echo "Restoring android/app/google-services.json from GOOGLE_SERVICES_JSON_BASE64 secret..."
-            printf '%s' "$GOOGLE_SERVICES_JSON_BASE64" | tr -d '\r\n ' | base64 --decode > android/app/google-services.json
-          elif [ -n "$GOOGLE_SERVICES_BASE64" ]; then
-            echo "Restoring android/app/google-services.json from GOOGLE_SERVICES_BASE64 secret..."
-            printf '%s' "$GOOGLE_SERVICES_BASE64" | tr -d '\r\n ' | base64 --decode > android/app/google-services.json
-          elif [ -n "$GOOGLE_SERVICES_JSON" ]; then
-            echo "Restoring android/app/google-services.json from GOOGLE_SERVICES_JSON secret..."
-            printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
-          elif [ -s "android/app/google-services.json" ]; then
-            echo "Using repository android/app/google-services.json..."
-          elif [ -s "public/assets/aistudio/google-services__14__37dea63f.json" ]; then
-            echo "Copying verified repository asset to android/app/google-services.json..."
-            cp public/assets/aistudio/google-services__14__37dea63f.json android/app/google-services.json
-          fi
-
-          if [ ! -s "android/app/google-services.json" ]; then
-            echo "::error::android/app/google-services.json is missing or empty! Commit android/app/google-services.json or set GOOGLE_SERVICES_JSON_BASE64 in GitHub Secrets."
-            exit 1
+          echo "Checked-out commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+          if git ls-files --error-unmatch android/app/google-services.json >/dev/null 2>&1; then
+            echo "Git status: android/app/google-services.json IS tracked in this repository commit."
+          else
+            echo "Git status: android/app/google-services.json is NOT tracked in this checked-out commit."
           fi
 
           node -e '
             const fs = require("fs");
-            const gs = JSON.parse(fs.readFileSync("android/app/google-services.json", "utf8"));
+            const targetPath = "android/app/google-services.json";
+            const fallbackAssetPath = "public/assets/aistudio/google-services__14__37dea63f.json";
+
+            function decodeSecretToJsonText(rawValue, label) {
+              const trimmed = String(rawValue || "").replace(/^\uFEFF/, "").trim();
+              if (!trimmed) return null;
+
+              // Allow raw JSON even if placed in a *_BASE64 secret
+              if (trimmed.startsWith("{")) {
+                JSON.parse(trimmed);
+                return trimmed;
+              }
+
+              // Normalize standard or URL-safe Base64 without padding issues
+              let b64 = trimmed.replace(/[\r\n\s]+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+              const pad = b64.length % 4;
+              if (pad === 2) b64 += "==";
+              else if (pad === 3) b64 += "=";
+              else if (pad === 1) {
+                throw new Error(label + " has invalid Base64 length.");
+              }
+
+              const decoded = Buffer.from(b64, "base64").toString("utf8").replace(/^\uFEFF/, "").trim();
+              if (!decoded.startsWith("{")) {
+                throw new Error(label + " decoded content is not valid JSON.");
+              }
+              JSON.parse(decoded);
+              return decoded;
+            }
+
+            const candidates = [
+              ["GOOGLE_SERVICES_JSON_BASE64", process.env.GOOGLE_SERVICES_JSON_BASE64],
+              ["GOOGLE_SERVICES_BASE64", process.env.GOOGLE_SERVICES_BASE64],
+              ["GOOGLE_SERVICES_JSON", process.env.GOOGLE_SERVICES_JSON]
+            ];
+
+            let restoredFrom = null;
+            for (const [name, value] of candidates) {
+              if (value && String(value).trim()) {
+                try {
+                  const jsonText = decodeSecretToJsonText(value, name);
+                  fs.writeFileSync(targetPath, jsonText, "utf8");
+                  restoredFrom = "GitHub Secret " + name;
+                  break;
+                } catch (err) {
+                  console.error("::error::Failed to decode " + name + ": " + err.message);
+                  process.exit(1);
+                }
+              }
+            }
+
+            if (!restoredFrom) {
+              if (fs.existsSync(targetPath) && fs.statSync(targetPath).size > 0) {
+                restoredFrom = "repository file " + targetPath;
+              } else if (fs.existsSync(fallbackAssetPath) && fs.statSync(fallbackAssetPath).size > 0) {
+                fs.copyFileSync(fallbackAssetPath, targetPath);
+                restoredFrom = "fallback repository asset " + fallbackAssetPath;
+              }
+            }
+
+            if (!restoredFrom || !fs.existsSync(targetPath) || fs.statSync(targetPath).size === 0) {
+              console.error("::error::android/app/google-services.json is missing or empty!");
+              console.error("::error::Neither android/app/google-services.json nor GOOGLE_SERVICES_JSON_BASE64 secret was available in this GitHub Actions run.");
+              console.error("Fix: Push/sync the updated repo (including android/app/google-services.json) OR set GitHub Secret GOOGLE_SERVICES_JSON_BASE64.");
+              process.exit(1);
+            }
+
+            console.log("Restored android/app/google-services.json from:", restoredFrom);
+
+            const gs = JSON.parse(fs.readFileSync(targetPath, "utf8"));
             const projectId = gs?.project_info?.project_id;
             if (projectId !== "avian-gate-pbcxw") {
               console.error("::error::google-services.json project_id mismatch! Expected avian-gate-pbcxw, got: " + projectId);
@@ -259,6 +314,12 @@ jobs:
           '
 
           npx cap sync android
+
+          if [ ! -s "android/app/google-services.json" ]; then
+            echo "::error::android/app/google-services.json disappeared or became empty after npx cap sync android!"
+            exit 1
+          fi
+          echo "Post-sync check passed: android/app/google-services.json ($(wc -c < android/app/google-services.json) bytes)"
 
       - name: Verify Fixed Package Identity & Release Signing Policy
         run: |

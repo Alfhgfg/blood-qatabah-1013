@@ -1352,16 +1352,16 @@
       "minUpgradeFromVersionCode": 1,
       "mandatory": false,
       "releaseNotes": "اختبار تحديث مباشر",
-      "releasedAt": "2026-11-23T13:49:38.404Z"
+      "releasedAt": "2026-11-23T13:57:13.222Z"
     },
     "web": {
       "versionCode": 2,
       "versionName": "1.1.0",
       "mandatory": false,
       "releaseNotes": "تحديث ويب تجريبي",
-      "releasedAt": "2026-11-23T13:49:38.404Z"
+      "releasedAt": "2026-11-23T13:57:13.222Z"
     },
-    "updatedAt": "2026-11-23T13:49:38.404Z",
+    "updatedAt": "2026-11-23T13:57:13.222Z",
     "updatedBy": "admin"
   },
   "users": [
