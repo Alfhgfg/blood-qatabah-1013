@@ -32,7 +32,9 @@ import java.net.URL;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -40,6 +42,8 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /**
  * Native Capacitor Plugin for safe, in-place Android APK updates.
@@ -134,13 +138,21 @@ public class AppUpdatePlugin extends Plugin {
     @PluginMethod
     public void cleanupUpdateFiles(PluginCall call) {
         try {
-            File updatesDir = getConfinedUpdatesDir(getContext());
+            Context context = getContext();
+            boolean preserveValidNewer = Boolean.TRUE.equals(call.getBoolean("preserveValidNewer", false));
+            File updatesDir = getConfinedUpdatesDir(context);
             int deleted = 0;
             if (updatesDir.exists() && updatesDir.isDirectory()) {
                 File[] files = updatesDir.listFiles();
                 if (files != null) {
                     for (File f : files) {
-                        if (f.isFile() && f.delete()) {
+                        if (!f.isFile()) continue;
+                        if (preserveValidNewer && VERIFIED_APK_FILENAME.equals(f.getName())) {
+                            if (isVerifiedApkReadyForUpgrade(context, f, 0L)) {
+                                continue;
+                            }
+                        }
+                        if (f.delete()) {
                             deleted++;
                         }
                     }
@@ -156,9 +168,42 @@ public class AppUpdatePlugin extends Plugin {
     }
 
     @PluginMethod
+    public void getDownloadedApkStatus(PluginCall call) {
+        try {
+            Context context = getContext();
+            Long expectedVersionCodeObj = call.getLong("expectedVersionCode");
+            long expectedVersionCode = expectedVersionCodeObj != null ? expectedVersionCodeObj : 0L;
+            File updatesDir = getConfinedUpdatesDir(context);
+            File apkFile = new File(updatesDir, VERIFIED_APK_FILENAME);
+            verifyCanonicalChild(updatesDir, apkFile);
+
+            JSObject ret = new JSObject();
+            if (!apkFile.exists() || apkFile.length() <= 0 || !isVerifiedApkReadyForUpgrade(context, apkFile, expectedVersionCode)) {
+                ret.put("ready", false);
+                call.resolve(ret);
+                return;
+            }
+
+            PackageInfo archivePkg = getArchivePackageInfo(context.getPackageManager(), apkFile.getAbsolutePath());
+            long versionCode = archivePkg != null ? PackageInfoCompat.getLongVersionCode(archivePkg) : 0L;
+            ret.put("ready", true);
+            ret.put("fileName", VERIFIED_APK_FILENAME);
+            ret.put("fileSize", apkFile.length());
+            ret.put("versionCode", versionCode);
+            ret.put("versionName", archivePkg != null && archivePkg.versionName != null ? archivePkg.versionName : "");
+            call.resolve(ret);
+        } catch (Exception e) {
+            JSObject ret = new JSObject();
+            ret.put("ready", false);
+            call.resolve(ret);
+        }
+    }
+
+    @PluginMethod
     public void downloadAndVerifyApk(PluginCall call) {
         String downloadUrl = call.getString("url", "");
         String expectedSha256 = call.getString("expectedSha256", "");
+        String expectedSigningCertSha256 = call.getString("expectedSigningCertSha256", "");
         Long expectedFileSizeObj = call.getLong("expectedFileSize");
         Long expectedVersionCodeObj = call.getLong("expectedVersionCode");
         Integer expectedMinSdkObj = call.getInt("minSdkVersion");
@@ -176,6 +221,9 @@ public class AppUpdatePlugin extends Plugin {
         downloadCancelled.set(false);
         final String cleanUrl = downloadUrl.trim();
         final String normExpectedSha = expectedSha256 != null ? expectedSha256.trim().toLowerCase(Locale.US) : "";
+        final String normExpectedCertSha = expectedSigningCertSha256 != null
+                ? expectedSigningCertSha256.replace(":", "").trim().toLowerCase(Locale.US)
+                : "";
         final long expectedFileSize = expectedFileSizeObj != null ? expectedFileSizeObj : 0L;
         final long expectedVersionCode = expectedVersionCodeObj != null ? expectedVersionCodeObj : 0L;
         final int expectedMinSdk = expectedMinSdkObj != null ? expectedMinSdkObj : 0;
@@ -185,6 +233,17 @@ public class AppUpdatePlugin extends Plugin {
             File partFile = null;
             try {
                 Context context = getContext();
+
+                // Pre-download signing certificate check against the currently installed app
+                PackageInfo precheckInstalledPkg = getInstalledPackageInfo(context);
+                Set<String> precheckDigests = new HashSet<>(extractSigningDigests(precheckInstalledPkg));
+                if (!normExpectedCertSha.isEmpty() && !precheckDigests.isEmpty() && !precheckDigests.contains(normExpectedCertSha)) {
+                    throw new UpdateException(
+                            "SIGNATURE_MISMATCH",
+                            "شهادة التوقيع الرقمي لهذا التحديث لا تطابق توقيع النسخة المثبتة حالياً. تم إيقاف التحديث تلقائياً لحماية بياناتك ومنع مطالبتك بحذف التطبيق."
+                    );
+                }
+
                 File updatesDir = getConfinedUpdatesDir(context);
                 if (!updatesDir.exists() && !updatesDir.mkdirs()) {
                     throw new UpdateException("STORAGE_ERROR", "تعذر إنشاء مجلد التخزين المؤقت للتحديث.");
@@ -271,10 +330,11 @@ public class AppUpdatePlugin extends Plugin {
                     throw new UpdateException("FILE_SIZE_MISMATCH", "حجم ملف التحديث لا يطابق الحجم المتوقع.");
                 }
 
-                // 3. ZIP / APK magic header check (PK\x03\x04)
+                // 3. ZIP / APK magic header check (PK\x03\x04) + AndroidManifest + Device ABI compatibility
                 if (!hasValidApkMagicHeader(partFile)) {
                     throw new UpdateException("CORRUPT_APK", "ملف التحديث تالف أو ليس حزمة تطبيق أندرويد صالحة.");
                 }
+                verifyApkZipAndAbi(partFile);
 
                 // 4. SHA-256 checksum verification
                 String actualSha256 = bytesToHex(sha256Digest.digest());
@@ -340,10 +400,10 @@ public class AppUpdatePlugin extends Plugin {
                         break;
                     }
                 }
-                if (!signaturesMatch) {
+                if (!signaturesMatch || (!normExpectedCertSha.isEmpty() && !archiveDigests.contains(normExpectedCertSha))) {
                     throw new UpdateException(
                             "SIGNATURE_MISMATCH",
-                            "توقيع التحديث الرقمي لا يطابق توقيع النسخة المثبتة حالياً. لحماية بياناتك ومنع طلب حذف التطبيق، تم رفض التثبيت."
+                            "توقيع التحديث الرقمي لا يطابق توقيع النسخة المثبتة حالياً. لحماية بياناتك ومنع طلب حذف التطبيق، تم إيقاف التحديث تلقائياً."
                     );
                 }
 
@@ -391,6 +451,38 @@ public class AppUpdatePlugin extends Plugin {
                 return;
             }
 
+            // Re-verify package identity, versionCode, ABI, and signature right before invoking Android installer
+            PackageInfo installedPkg = getInstalledPackageInfo(context);
+            long installedVersionCode = PackageInfoCompat.getLongVersionCode(installedPkg);
+            PackageInfo archivePkg = getArchivePackageInfo(context.getPackageManager(), apkFile.getAbsolutePath());
+            if (archivePkg == null || !context.getPackageName().equals(archivePkg.packageName)) {
+                deleteQuietly(apkFile);
+                call.reject("PACKAGE_MISMATCH", "ملف التحديث لا يطابق معرّف التطبيق المثبت.");
+                return;
+            }
+            if (PackageInfoCompat.getLongVersionCode(archivePkg) <= installedVersionCode) {
+                deleteQuietly(apkFile);
+                call.reject("VERSION_NOT_NEWER", "إصدار ملف التحديث ليس أحدث من الإصدار المثبت حالياً.");
+                return;
+            }
+            Set<String> installedDigests = new HashSet<>(extractSigningDigests(installedPkg));
+            Set<String> archiveDigests = new HashSet<>(extractSigningDigests(archivePkg));
+            boolean sigMatch = false;
+            for (String digest : archiveDigests) {
+                if (installedDigests.contains(digest)) {
+                    sigMatch = true;
+                    break;
+                }
+            }
+            if (!sigMatch) {
+                deleteQuietly(apkFile);
+                call.reject(
+                        "SIGNATURE_MISMATCH",
+                        "شهادة توقيع التحديث تختلف عن النسخة المثبتة. تم إيقاف التثبيت لحماية بياناتك ومنع طلب حذف التطبيق."
+                );
+                return;
+            }
+
             if (!canAppInstallPackages(context)) {
                 JSObject ret = new JSObject();
                 ret.put("started", false);
@@ -412,7 +504,17 @@ public class AppUpdatePlugin extends Plugin {
             installIntent.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
             installIntent.putExtra(Intent.EXTRA_RETURN_RESULT, false);
 
-            context.startActivity(installIntent);
+            if (installIntent.resolveActivity(context.getPackageManager()) == null) {
+                @SuppressWarnings("deprecation")
+                Intent fallbackIntent = new Intent(Intent.ACTION_INSTALL_PACKAGE);
+                fallbackIntent.setData(apkUri);
+                fallbackIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                fallbackIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                fallbackIntent.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
+                context.startActivity(fallbackIntent);
+            } else {
+                context.startActivity(installIntent);
+            }
 
             JSObject ret = new JSObject();
             ret.put("started", true);
@@ -496,6 +598,88 @@ public class AppUpdatePlugin extends Plugin {
                     && magic[2] == 0x03
                     && magic[3] == 0x04;
         } catch (IOException e) {
+            return false;
+        }
+    }
+
+    private static void verifyApkZipAndAbi(File apkFile) throws UpdateException {
+        boolean hasManifest = false;
+        Set<String> apkAbis = new HashSet<>();
+        try (ZipFile zip = new ZipFile(apkFile)) {
+            Enumeration<? extends ZipEntry> entries = zip.entries();
+            while (entries.hasMoreElements()) {
+                ZipEntry entry = entries.nextElement();
+                String name = entry.getName();
+                if ("AndroidManifest.xml".equals(name)) {
+                    hasManifest = true;
+                } else if (name != null && name.startsWith("lib/") && !entry.isDirectory()) {
+                    String[] parts = name.split("/");
+                    if (parts.length >= 3 && !parts[1].isEmpty()) {
+                        apkAbis.add(parts[1]);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new UpdateException("CORRUPT_APK", "ملف التحديث تالف ولا يمكن قراءة بنيته البرمجية.");
+        }
+
+        if (!hasManifest) {
+            throw new UpdateException("CORRUPT_APK", "ملف التحديث يفتقد إلى AndroidManifest.xml الصالح.");
+        }
+
+        if (!apkAbis.isEmpty()) {
+            List<String> deviceAbis = Arrays.asList(Build.SUPPORTED_ABIS);
+            boolean abiMatch = false;
+            for (String abi : apkAbis) {
+                if (deviceAbis.contains(abi)) {
+                    abiMatch = true;
+                    break;
+                }
+            }
+            if (!abiMatch) {
+                throw new UpdateException(
+                        "INCOMPATIBLE_ABI",
+                        "حزمة التحديث غير متوافقة مع معمارية معالج الجهاز (" + Arrays.toString(Build.SUPPORTED_ABIS) + ")."
+                );
+            }
+        }
+    }
+
+    private static boolean isVerifiedApkReadyForUpgrade(Context context, File apkFile, long expectedVersionCode) {
+        try {
+            if (apkFile == null || !apkFile.exists() || apkFile.length() <= 0 || !hasValidApkMagicHeader(apkFile)) {
+                return false;
+            }
+            verifyApkZipAndAbi(apkFile);
+            PackageInfo installedPkg = getInstalledPackageInfo(context);
+            long installedVersionCode = PackageInfoCompat.getLongVersionCode(installedPkg);
+            PackageInfo archivePkg = getArchivePackageInfo(context.getPackageManager(), apkFile.getAbsolutePath());
+            if (archivePkg == null || !context.getPackageName().equals(archivePkg.packageName)) {
+                return false;
+            }
+            long archiveVersionCode = PackageInfoCompat.getLongVersionCode(archivePkg);
+            if (archiveVersionCode <= installedVersionCode) {
+                return false;
+            }
+            if (expectedVersionCode > 0 && archiveVersionCode != expectedVersionCode) {
+                return false;
+            }
+            int archiveMinSdk = archivePkg.applicationInfo != null ? archivePkg.applicationInfo.minSdkVersion : 0;
+            if (archiveMinSdk > Build.VERSION.SDK_INT) {
+                return false;
+            }
+            Set<String> installedDigests = new HashSet<>(extractSigningDigests(installedPkg));
+            Set<String> archiveDigests = new HashSet<>(extractSigningDigests(archivePkg));
+            if (installedDigests.isEmpty() || archiveDigests.isEmpty()) {
+                return false;
+            }
+            for (String digest : archiveDigests) {
+                if (installedDigests.contains(digest)) {
+                    return true;
+                }
+            }
+            return false;
+        } catch (Exception e) {
             return false;
         }
     }

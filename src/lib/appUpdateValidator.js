@@ -1,31 +1,34 @@
 export const EXPECTED_ANDROID_PACKAGE_NAME = 'org.alnasr.bloodqatabah';
 export const DEFAULT_MIN_SDK_VERSION = 24;
 export const MAX_APK_FILE_SIZE_BYTES = 262144000; // 250 MB
+export const CURRENT_BASE_VERSION_CODE = 4;
+export const CURRENT_BASE_VERSION_NAME = '1.0.3';
 
 export function createDefaultAppUpdateConfig() {
   return {
     enabled: false,
     android: {
-      versionCode: 1,
-      versionName: '1.0',
+      versionCode: CURRENT_BASE_VERSION_CODE,
+      versionName: CURRENT_BASE_VERSION_NAME,
       packageName: EXPECTED_ANDROID_PACKAGE_NAME,
       downloadUrl: '',
       sha256: '',
+      signingCertSha256: '',
       fileSize: 0,
       minSdkVersion: DEFAULT_MIN_SDK_VERSION,
       minUpgradeFromVersionCode: 1,
       mandatory: false,
       releaseNotes: '',
-      releasedAt: '2026-10-01T00:00:00Z'
+      releasedAt: '2026-11-23T00:00:00Z'
     },
     web: {
-      versionCode: 1,
-      versionName: '1.0',
+      versionCode: CURRENT_BASE_VERSION_CODE,
+      versionName: CURRENT_BASE_VERSION_NAME,
       mandatory: false,
       releaseNotes: '',
-      releasedAt: '2026-10-01T00:00:00Z'
+      releasedAt: '2026-11-23T00:00:00Z'
     },
-    updatedAt: '2026-10-01T00:00:00Z',
+    updatedAt: '2026-11-23T00:00:00Z',
     updatedBy: 'system'
   };
 }
@@ -176,6 +179,18 @@ export function validateAndNormalizeAppUpdateConfig(input, updatedBy = 'admin') 
     };
   }
 
+  const rawSigningCertSha256 = String(rawAndroid.signingCertSha256 || '')
+    .trim()
+    .replace(/:/g, '')
+    .toLowerCase();
+  if (rawSigningCertSha256 && !isValidSha256Hex(rawSigningCertSha256)) {
+    return {
+      valid: false,
+      code: 'INVALID_SIGNING_CERT',
+      error: 'بصمة شهادة التوقيع الرقمي (signingCertSha256) يجب أن تتكون من 64 محرفاً ست عشرياً (Hex)'
+    };
+  }
+
   if (enabled && normalizedDownloadUrl && !rawSha256) {
     return {
       valid: false,
@@ -205,6 +220,7 @@ export function validateAndNormalizeAppUpdateConfig(input, updatedBy = 'admin') 
         packageName: EXPECTED_ANDROID_PACKAGE_NAME,
         downloadUrl: normalizedDownloadUrl,
         sha256: rawSha256,
+        signingCertSha256: rawSigningCertSha256,
         fileSize,
         minSdkVersion,
         minUpgradeFromVersionCode,
@@ -340,6 +356,21 @@ export function checkUpdateCompatibility(installed, remoteConfig) {
         updateAvailable: false,
         reasonCode: 'MISSING_CHECKSUM',
         reasonMessage: 'ملف التحديث يفتقر إلى بصمة التحقق الرقمية SHA-256 المطلوبة للتحقق من سلامته.'
+      };
+    }
+
+    // Pre-download signing certificate verification when both installed digests and manifest signingCertSha256 are known
+    const targetCert = String(target.signingCertSha256 || '').replace(/:/g, '').trim().toLowerCase();
+    const installedDigests = Array.isArray(installed.signingDigests)
+      ? installed.signingDigests.map((d) => String(d || '').replace(/:/g, '').trim().toLowerCase()).filter(Boolean)
+      : [];
+    if (isValidSha256Hex(targetCert) && installedDigests.length > 0 && !installedDigests.includes(targetCert)) {
+      return {
+        compatible: false,
+        updateAvailable: false,
+        reasonCode: 'SIGNATURE_MISMATCH',
+        reasonMessage:
+          'شهادة التوقيع الرقمي لهذا التحديث لا تطابق توقيع النسخة المثبتة حالياً. تم إيقاف التحديث تلقائياً لحماية بياناتك ومنع مطالبتك بحذف التطبيق.'
       };
     }
 

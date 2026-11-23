@@ -1,0 +1,31 @@
+{
+  "packageName": "org.alnasr.bloodqatabah",
+  "currentVersionCode": 4,
+  "currentVersionName": "1.0.3",
+  "history": [
+    {
+      "versionCode": 1,
+      "versionName": "1.0.0",
+      "recordedAt": "2026-10-01T00:00:00Z",
+      "notes": "الإصدار التأسيسي الأول"
+    },
+    {
+      "versionCode": 2,
+      "versionName": "1.0.1",
+      "recordedAt": "2026-10-15T00:00:00Z",
+      "notes": "تحسينات الأداء وسجل المتبرعين"
+    },
+    {
+      "versionCode": 3,
+      "versionName": "1.0.2",
+      "recordedAt": "2026-11-01T00:00:00Z",
+      "notes": "تعزيز الإشعارات والتحديث المباشر"
+    },
+    {
+      "versionCode": 4,
+      "versionName": "1.0.3",
+      "recordedAt": "2026-11-23T00:00:00Z",
+      "notes": "تثبيت هوية التطبيق ونظام التحديث المتسلسل الآمن"
+    }
+  ]
+}

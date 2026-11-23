@@ -7,6 +7,8 @@ import type {
   UpdateProgressState
 } from '../types';
 import {
+  CURRENT_BASE_VERSION_CODE,
+  CURRENT_BASE_VERSION_NAME,
   EXPECTED_ANDROID_PACKAGE_NAME,
   checkUpdateCompatibility,
   validateAndNormalizeAppUpdateConfig
@@ -26,10 +28,18 @@ interface AppUpdateNativePlugin {
   canInstallPackages(): Promise<{ allowed: boolean }>;
   openInstallPermissionSettings(): Promise<{ opened: boolean; alreadyAllowed: boolean }>;
   cancelDownload(): Promise<{ cancelled: boolean }>;
-  cleanupUpdateFiles(): Promise<{ cleaned: boolean; deletedCount: number }>;
+  cleanupUpdateFiles(options?: { preserveValidNewer?: boolean }): Promise<{ cleaned: boolean; deletedCount: number }>;
+  getDownloadedApkStatus(options?: { expectedVersionCode?: number }): Promise<{
+    ready: boolean;
+    fileName?: string;
+    fileSize?: number;
+    versionCode?: number;
+    versionName?: string;
+  }>;
   downloadAndVerifyApk(options: {
     url: string;
     expectedSha256?: string;
+    expectedSigningCertSha256?: string;
     expectedFileSize?: number;
     expectedVersionCode?: number;
     minSdkVersion?: number;
@@ -60,8 +70,14 @@ const SNOOZE_SESSION_KEY = 'qaatabah_update_snoozed_version_v1';
 const APPLIED_WEB_VERSION_KEY = 'qaatabah_applied_web_version_v1';
 
 export function getCompiledVersionInfo(): { versionCode: number; versionName: string } {
-  const code = typeof __APP_VERSION_CODE__ === 'number' && __APP_VERSION_CODE__ > 0 ? __APP_VERSION_CODE__ : 1;
-  const name = typeof __APP_VERSION_NAME__ === 'string' && __APP_VERSION_NAME__.trim() ? __APP_VERSION_NAME__.trim() : '1.0';
+  const code =
+    typeof __APP_VERSION_CODE__ === 'number' && __APP_VERSION_CODE__ > 0
+      ? __APP_VERSION_CODE__
+      : CURRENT_BASE_VERSION_CODE;
+  const name =
+    typeof __APP_VERSION_NAME__ === 'string' && __APP_VERSION_NAME__.trim()
+      ? __APP_VERSION_NAME__.trim()
+      : CURRENT_BASE_VERSION_NAME;
   return { versionCode: code, versionName: name };
 }
 
@@ -128,8 +144,8 @@ export const appUpdateService = {
         return {
           platform: 'android',
           packageName: info.packageName || EXPECTED_ANDROID_PACKAGE_NAME,
-          versionCode: Number(info.versionCode) || 1,
-          versionName: info.versionName || '1.0',
+          versionCode: Number(info.versionCode) || CURRENT_BASE_VERSION_CODE,
+          versionName: info.versionName || CURRENT_BASE_VERSION_NAME,
           sdkInt: Number(info.sdkInt) || undefined,
           signingDigests: Array.isArray(info.signingDigests) ? info.signingDigests : [],
           canRequestPackageInstalls: Boolean(info.canRequestPackageInstalls)
@@ -148,12 +164,36 @@ export const appUpdateService = {
     };
   },
 
-  async cleanupNativeUpdateCache(): Promise<void> {
+  async cleanupNativeUpdateCache(preserveValidNewer = true): Promise<void> {
     if (!isNativeAndroidPlatform()) return;
     try {
-      await AppUpdateNative.cleanupUpdateFiles();
+      await AppUpdateNative.cleanupUpdateFiles({ preserveValidNewer });
     } catch {
       // Ignore cleanup errors on startup
+    }
+  },
+
+  async getDownloadedApkStatus(expectedVersionCode?: number): Promise<{
+    ready: boolean;
+    fileSize?: number;
+    versionCode?: number;
+    versionName?: string;
+  }> {
+    if (!isNativeAndroidPlatform()) {
+      return { ready: false };
+    }
+    try {
+      const res = await AppUpdateNative.getDownloadedApkStatus(
+        expectedVersionCode ? { expectedVersionCode } : {}
+      );
+      return {
+        ready: Boolean(res?.ready),
+        fileSize: Number(res?.fileSize) || 0,
+        versionCode: Number(res?.versionCode) || 0,
+        versionName: res?.versionName || ''
+      };
+    } catch {
+      return { ready: false };
     }
   },
 
@@ -268,37 +308,22 @@ export const appUpdateService = {
   async retryInstallAfterPermission(
     onProgress: (state: UpdateProgressState) => void
   ): Promise<{ started: boolean; needsPermission: boolean }> {
-    if (!isNativeAndroidPlatform()) {
-      return { started: false, needsPermission: false };
-    }
-    const allowed = await this.canInstallPackages();
-    if (!allowed) {
-      onProgress({
-        phase: 'permission_required',
-        progress: 100,
-        downloadedBytes: 0,
-        totalBytes: 0
-      });
-      return { started: false, needsPermission: true };
-    }
-
-    onProgress({
-      phase: 'installing',
-      progress: 100,
-      downloadedBytes: 0,
-      totalBytes: 0
-    });
-    const res = await AppUpdateNative.installVerifiedApk();
-    return { started: Boolean(res.started), needsPermission: Boolean(res.needsPermission) };
+    return this.installDownloadedUpdate(onProgress);
   },
 
-  async downloadAndInstallUpdate(
+  /**
+   * Step 1 (Android): Downloads the APK, verifies SHA-256, ABI, SDK, packageName,
+   * and signing certificate match, then stops at `ready_to_install` so the user
+   * explicitly sees and taps the "Install Update" button.
+   * On Web/PWA: applies the updated Service Worker immediately while preserving user data.
+   */
+  async downloadUpdate(
     checkResult: UpdateCheckResult,
     onProgress: (state: UpdateProgressState) => void
-  ): Promise<{ started: boolean; needsPermission?: boolean; reloaded?: boolean }> {
+  ): Promise<{ downloaded: boolean; started?: boolean; reloaded?: boolean; fileSize?: number }> {
     const installed = await this.getInstalledAppInfo();
 
-    // Native Android APK in-place update flow
+    // Native Android APK download & verification step
     if (installed.platform === 'android') {
       const remoteConfig = checkResult.remoteConfig;
       const compatibility = checkUpdateCompatibility(installed, remoteConfig);
@@ -312,7 +337,7 @@ export const appUpdateService = {
           errorCode: compatibility.reasonCode || 'INCOMPATIBLE_UPDATE',
           errorMessage: compatibility.reasonMessage || 'التحديث غير متوافق مع النسخة المثبتة حالياً.'
         });
-        return { started: false };
+        return { downloaded: false };
       }
 
       const target = remoteConfig.android;
@@ -335,51 +360,24 @@ export const appUpdateService = {
           });
         });
 
-        await AppUpdateNative.downloadAndVerifyApk({
+        const verifyRes = await AppUpdateNative.downloadAndVerifyApk({
           url: target.downloadUrl,
           expectedSha256: target.sha256,
+          expectedSigningCertSha256: target.signingCertSha256 || undefined,
           expectedFileSize: target.fileSize > 0 ? target.fileSize : undefined,
           expectedVersionCode: target.versionCode,
           minSdkVersion: target.minSdkVersion
         });
 
+        const finalSize = Number(verifyRes?.fileSize) || target.fileSize || 0;
         onProgress({
           phase: 'ready_to_install',
           progress: 100,
-          downloadedBytes: target.fileSize || 0,
-          totalBytes: target.fileSize || 0
+          downloadedBytes: finalSize,
+          totalBytes: finalSize
         });
 
-        const allowed = await this.canInstallPackages();
-        if (!allowed) {
-          onProgress({
-            phase: 'permission_required',
-            progress: 100,
-            downloadedBytes: target.fileSize || 0,
-            totalBytes: target.fileSize || 0
-          });
-          return { started: false, needsPermission: true };
-        }
-
-        onProgress({
-          phase: 'installing',
-          progress: 100,
-          downloadedBytes: target.fileSize || 0,
-          totalBytes: target.fileSize || 0
-        });
-
-        const installRes = await AppUpdateNative.installVerifiedApk();
-        if (installRes.needsPermission) {
-          onProgress({
-            phase: 'permission_required',
-            progress: 100,
-            downloadedBytes: target.fileSize || 0,
-            totalBytes: target.fileSize || 0
-          });
-          return { started: false, needsPermission: true };
-        }
-
-        return { started: Boolean(installRes.started), needsPermission: false };
+        return { downloaded: true, fileSize: finalSize };
       } catch (err: any) {
         const message =
           err?.message ||
@@ -393,7 +391,7 @@ export const appUpdateService = {
           errorCode: err?.code || 'UPDATE_FAILED',
           errorMessage: message
         });
-        return { started: false };
+        return { downloaded: false };
       } finally {
         if (listenerHandle) {
           try {
@@ -466,7 +464,7 @@ export const appUpdateService = {
         window.location.reload();
       }, 350);
 
-      return { started: true, reloaded: true };
+      return { downloaded: true, started: true, reloaded: true };
     } catch (err: any) {
       onProgress({
         phase: 'error',
@@ -476,8 +474,94 @@ export const appUpdateService = {
         errorCode: 'WEB_UPDATE_FAILED',
         errorMessage: err?.message || 'تعذر تطبيق تحديث الويب. يرجى المحاولة مرة أخرى.'
       });
+      return { downloaded: false, started: false };
+    }
+  },
+
+  /**
+   * Step 2 (Android): Launches Android's official package installer on the already
+   * downloaded and signature-verified APK, updating in place without uninstalling.
+   */
+  async installDownloadedUpdate(
+    onProgress: (state: UpdateProgressState) => void,
+    expectedFileSize = 0
+  ): Promise<{ started: boolean; needsPermission: boolean }> {
+    if (!isNativeAndroidPlatform()) {
+      return { started: false, needsPermission: false };
+    }
+
+    try {
+      const allowed = await this.canInstallPackages();
+      if (!allowed) {
+        onProgress({
+          phase: 'permission_required',
+          progress: 100,
+          downloadedBytes: expectedFileSize,
+          totalBytes: expectedFileSize
+        });
+        return { started: false, needsPermission: true };
+      }
+
+      onProgress({
+        phase: 'installing',
+        progress: 100,
+        downloadedBytes: expectedFileSize,
+        totalBytes: expectedFileSize
+      });
+
+      const installRes = await AppUpdateNative.installVerifiedApk();
+      if (installRes.needsPermission) {
+        onProgress({
+          phase: 'permission_required',
+          progress: 100,
+          downloadedBytes: expectedFileSize,
+          totalBytes: expectedFileSize
+        });
+        return { started: false, needsPermission: true };
+      }
+
+      // If the user dismisses Android's system installer sheet and returns, keep the Install button usable
+      if (installRes.started) {
+        setTimeout(() => {
+          onProgress({
+            phase: 'ready_to_install',
+            progress: 100,
+            downloadedBytes: expectedFileSize,
+            totalBytes: expectedFileSize
+          });
+        }, 2500);
+      }
+
+      return { started: Boolean(installRes.started), needsPermission: false };
+    } catch (err: any) {
+      const message =
+        err?.message ||
+        err?.errorMessage ||
+        'تعذر فتح مثبت النظام لتثبيت التحديث. يمكنك إعادة المحاولة دون فقدان بياناتك.';
+      onProgress({
+        phase: 'error',
+        progress: 0,
+        downloadedBytes: 0,
+        totalBytes: expectedFileSize,
+        errorCode: err?.code || 'INSTALL_LAUNCH_FAILED',
+        errorMessage: message
+      });
+      return { started: false, needsPermission: false };
+    }
+  },
+
+  async downloadAndInstallUpdate(
+    checkResult: UpdateCheckResult,
+    onProgress: (state: UpdateProgressState) => void
+  ): Promise<{ started: boolean; needsPermission?: boolean; reloaded?: boolean }> {
+    const dl = await this.downloadUpdate(checkResult, onProgress);
+    if (!dl.downloaded) {
       return { started: false };
     }
+    if (dl.reloaded) {
+      return { started: true, reloaded: true };
+    }
+    return this.installDownloadedUpdate(onProgress, dl.fileSize || 0);
   },
 
   async saveUpdateConfig(

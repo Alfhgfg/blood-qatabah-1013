@@ -1,5 +1,5 @@
 // Service Worker for Offline PWA & Push Notifications - سجل المتبرعين بالدم (قعطبة)
-const CACHE_NAME = 'qaatabah-blood-registry-v3';
+const CACHE_NAME = 'qaatabah-blood-registry-v4';
 
 const STATIC_ASSETS = [
   './',
@@ -143,6 +143,17 @@ self.addEventListener('fetch', (event) => {
 
   // Only handle GET requests
   if (request.method !== 'GET') {
+    return;
+  }
+
+  // Never intercept or cache Firestore, Firebase Auth, or backend API requests
+  const reqUrl = request.url;
+  if (
+    reqUrl.includes('firestore.googleapis.com') ||
+    reqUrl.includes('identitytoolkit.googleapis.com') ||
+    reqUrl.includes('securetoken.googleapis.com') ||
+    reqUrl.includes('/api/')
+  ) {
     return;
   }
 

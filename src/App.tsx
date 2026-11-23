@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react';
-import { Droplet, Loader2, Lock } from 'lucide-react';
+import { ArrowUpCircle, Download, Droplet, Loader2, Lock, ShieldAlert } from 'lucide-react';
 import { 
   ActivePage, 
   BloodRequest, 
@@ -405,14 +405,35 @@ export default function App() {
           : Boolean(result.remoteConfig?.web?.mandatory);
 
       if (result.updateAvailable) {
+        let initialPhase: UpdateProgressState['phase'] = 'available';
+        let initialProgress = 0;
+        let initialBytes = 0;
+        const targetTotalBytes = result.remoteConfig?.android?.fileSize || 0;
+
+        if (result.platform === 'android' && result.compatible) {
+          const cachedApk = await appUpdateService.getDownloadedApkStatus(targetVersionCode);
+          if (cachedApk.ready) {
+            initialPhase = 'ready_to_install';
+            initialProgress = 100;
+            initialBytes = cachedApk.fileSize || targetTotalBytes;
+          }
+        }
+
         if (manual || isMandatory || !isVersionSnoozedForSession(targetVersionCode)) {
           setUpdateProgressState({
-            phase: 'available',
-            progress: 0,
-            downloadedBytes: 0,
-            totalBytes: result.remoteConfig?.android?.fileSize || 0
+            phase: initialPhase,
+            progress: initialProgress,
+            downloadedBytes: initialBytes,
+            totalBytes: initialBytes || targetTotalBytes
           });
           setIsUpdateModalOpen(true);
+        } else if (initialPhase === 'ready_to_install') {
+          setUpdateProgressState({
+            phase: 'ready_to_install',
+            progress: 100,
+            downloadedBytes: initialBytes,
+            totalBytes: initialBytes || targetTotalBytes
+          });
         }
       } else if (manual) {
         if (!result.compatible && result.compatibility.reasonMessage) {
@@ -436,10 +457,15 @@ export default function App() {
     }
   }, []);
 
-  const handleStartAppUpdate = useCallback(async () => {
+  const handleDownloadAppUpdate = useCallback(async () => {
     if (!updateCheckResult) return;
     clearSnoozedVersion();
-    await appUpdateService.downloadAndInstallUpdate(updateCheckResult, setUpdateProgressState);
+    await appUpdateService.downloadUpdate(updateCheckResult, setUpdateProgressState);
+  }, [updateCheckResult]);
+
+  const handleInstallAppUpdate = useCallback(async () => {
+    const fileSize = updateCheckResult?.remoteConfig?.android?.fileSize || 0;
+    await appUpdateService.installDownloadedUpdate(setUpdateProgressState, fileSize);
   }, [updateCheckResult]);
 
   const handleRetryInstallPermission = useCallback(async () => {
@@ -889,7 +915,6 @@ export default function App() {
       const isUpdateBusy =
         phase === 'downloading' ||
         phase === 'verifying' ||
-        phase === 'ready_to_install' ||
         phase === 'installing';
 
       if (!isMandatoryUpdate && !isUpdateBusy) {
@@ -1492,6 +1517,108 @@ export default function App() {
 
       {/* Main Content Area — Keep pages in the history stack mounted to preserve form/filter state */}
       <main className="flex-1 max-w-7xl mx-auto w-full px-4 sm:px-6 pt-5">
+        {/* In-App Update Notification Banner */}
+        {updateCheckResult &&
+          (updateCheckResult.updateAvailable ||
+            updateCheckResult.compatibility.reasonCode === 'SIGNATURE_MISMATCH') && (
+            <div
+              className={`mb-4 p-3.5 sm:p-4 rounded-2xl border shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
+                updateCheckResult.compatibility.reasonCode === 'SIGNATURE_MISMATCH' ||
+                updateProgressState.errorCode === 'SIGNATURE_MISMATCH'
+                  ? 'bg-red-50 border-red-200 text-red-950'
+                  : updateProgressState.phase === 'ready_to_install'
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-950'
+                    : 'bg-gradient-to-l from-amber-50 via-white to-rose-50 border-rose-200 text-slate-900'
+              }`}
+              dir="rtl"
+            >
+              <div className="flex items-start sm:items-center gap-3">
+                <div
+                  className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                    updateCheckResult.compatibility.reasonCode === 'SIGNATURE_MISMATCH' ||
+                    updateProgressState.errorCode === 'SIGNATURE_MISMATCH'
+                      ? 'bg-red-100 text-red-700'
+                      : updateProgressState.phase === 'ready_to_install'
+                        ? 'bg-emerald-600 text-white'
+                        : 'bg-rose-600 text-white'
+                  }`}
+                >
+                  {updateCheckResult.compatibility.reasonCode === 'SIGNATURE_MISMATCH' ||
+                  updateProgressState.errorCode === 'SIGNATURE_MISMATCH' ? (
+                    <ShieldAlert className="w-5 h-5" />
+                  ) : updateProgressState.phase === 'ready_to_install' ? (
+                    <ArrowUpCircle className="w-5 h-5" />
+                  ) : (
+                    <Download className="w-5 h-5" />
+                  )}
+                </div>
+                <div className="space-y-0.5 text-xs">
+                  <div className="font-black flex flex-wrap items-center gap-1.5">
+                    {updateCheckResult.compatibility.reasonCode === 'SIGNATURE_MISMATCH' ||
+                    updateProgressState.errorCode === 'SIGNATURE_MISMATCH' ? (
+                      <span>تم إيقاف التحديث تلقائياً: اختلاف شهادة التوقيع الرقمي</span>
+                    ) : updateProgressState.phase === 'ready_to_install' ? (
+                      <span>التحديث جاهز للتثبيت فوق النسخة الحالية بدون فقدان البيانات</span>
+                    ) : (
+                      <span>يتوفر إصدار جديد من التطبيق</span>
+                    )}
+                  </div>
+                  <div className="text-[11px] opacity-85 font-sans" dir="ltr">
+                    Current: v{updateCheckResult.installed.versionName} ({updateCheckResult.installed.versionCode}) → New: v
+                    {updateCheckResult.platform === 'android'
+                      ? `${updateCheckResult.remoteConfig?.android?.versionName || ''} (${updateCheckResult.remoteConfig?.android?.versionCode || ''})`
+                      : `${updateCheckResult.remoteConfig?.web?.versionName || ''} (${updateCheckResult.remoteConfig?.web?.versionCode || ''})`}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 self-end sm:self-auto shrink-0">
+                {updateCheckResult.compatibility.reasonCode === 'SIGNATURE_MISMATCH' ||
+                updateProgressState.errorCode === 'SIGNATURE_MISMATCH' ? (
+                  <button
+                    type="button"
+                    onClick={() => setIsUpdateModalOpen(true)}
+                    className="px-3.5 py-2 rounded-xl bg-red-600 hover:bg-red-700 text-white font-bold text-xs cursor-pointer"
+                  >
+                    عرض السبب
+                  </button>
+                ) : updateProgressState.phase === 'ready_to_install' &&
+                  updateCheckResult.platform === 'android' ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsUpdateModalOpen(true);
+                      handleInstallAppUpdate();
+                    }}
+                    className="px-4 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs cursor-pointer flex items-center gap-1.5 shadow-xs"
+                  >
+                    <ArrowUpCircle className="w-4 h-4" />
+                    <span>تثبيت التحديث</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (updateProgressState.phase === 'idle') {
+                        setUpdateProgressState({
+                          phase: 'available',
+                          progress: 0,
+                          downloadedBytes: 0,
+                          totalBytes: updateCheckResult.remoteConfig?.android?.fileSize || 0
+                        });
+                      }
+                      setIsUpdateModalOpen(true);
+                    }}
+                    className="px-4 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs cursor-pointer flex items-center gap-1.5 shadow-xs"
+                  >
+                    <Download className="w-4 h-4" />
+                    <span>{updateCheckResult.platform === 'android' ? 'تحميل التحديث' : 'تحديث الآن'}</span>
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
         {mountedPages.has('home') && (
           <div className={activePage === 'home' ? 'block' : 'hidden'}>
             <HomePage
@@ -1898,7 +2025,8 @@ export default function App() {
         isOpen={isUpdateModalOpen}
         checkResult={updateCheckResult}
         progressState={updateProgressState}
-        onStartUpdate={handleStartAppUpdate}
+        onStartUpdate={handleDownloadAppUpdate}
+        onInstallUpdate={handleInstallAppUpdate}
         onRetryInstallPermission={handleRetryInstallPermission}
         onOpenInstallPermissionSettings={handleOpenInstallPermissionSettings}
         onDismissLater={handleDismissUpdateLater}

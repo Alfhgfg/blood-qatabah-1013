@@ -262,6 +262,7 @@ export interface AndroidUpdateConfig {
   packageName: string;
   downloadUrl: string;
   sha256: string;
+  signingCertSha256?: string;
   fileSize: number;
   minSdkVersion: number;
   minUpgradeFromVersionCode: number;
@@ -300,6 +301,8 @@ export type UpdateCompatibilityReasonCode =
   | 'UP_TO_DATE'
   | 'DISABLED'
   | 'PACKAGE_MISMATCH'
+  | 'SIGNATURE_MISMATCH'
+  | 'INCOMPATIBLE_ABI'
   | 'INCOMPATIBLE_SDK'
   | 'VERSION_NOT_SUPPORTED_FOR_UPGRADE'
   | 'INVALID_DOWNLOAD_URL'

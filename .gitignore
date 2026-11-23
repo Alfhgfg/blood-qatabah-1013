@@ -8,6 +8,8 @@ coverage/
 !.env.example
 build-artifacts/
 android/app/release.keystore
+android/keystore.properties
+android/app/keystore.properties
 !android/app/google-services.json
 !public/assets/aistudio/google-services__14__37dea63f.json
 

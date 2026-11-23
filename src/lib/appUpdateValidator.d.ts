@@ -7,6 +7,8 @@ import type {
 export declare const EXPECTED_ANDROID_PACKAGE_NAME: string;
 export declare const DEFAULT_MIN_SDK_VERSION: number;
 export declare const MAX_APK_FILE_SIZE_BYTES: number;
+export declare const CURRENT_BASE_VERSION_CODE: number;
+export declare const CURRENT_BASE_VERSION_NAME: string;
 
 export declare function createDefaultAppUpdateConfig(): AppUpdateConfig;
 export declare function isPrivateOrInternalHost(hostname: string): boolean;

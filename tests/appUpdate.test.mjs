@@ -430,7 +430,238 @@ test('Permanent In-Place Update policy locks applicationId, release signing, and
   const androidGitignore = fs.readFileSync(path.resolve('android/.gitignore'), 'utf8');
   const appGitignore = fs.readFileSync(path.resolve('android/app/.gitignore'), 'utf8');
   assert.match(rootGitignore, /^!android\/app\/google-services\.json$/m);
+  assert.match(rootGitignore, /^android\/keystore\.properties$/m);
+  assert.match(rootGitignore, /^android\/app\/keystore\.properties$/m);
   assert.match(androidGitignore, /^!google-services\.json$/m);
   assert.match(appGitignore, /^!google-services\.json$/m);
+
+  // 6. Hardened release keystore & pinned certificate verification in CI and Gradle
+  assert.match(workflowYml, /VerifyReleaseKeystore/);
+  assert.match(workflowYml, /isKeyEntry\(alias\)/);
+  assert.match(workflowYml, /ANDROID_KEYSTORE_BASE64/);
+  assert.match(buildGradle, /keystore\.properties/);
+  assert.equal(fs.existsSync(path.resolve('scripts/prepare-release-signing.mjs')), true);
 });
+
+test('Sequential version manager enforces SemVer, monotonic versionCode, and unified state', async () => {
+  const vm = await import('../scripts/version-manager.mjs');
+  const os = await import('node:os');
+
+  // Verify live repository state is synchronized and valid
+  const liveState = vm.verifyUnifiedProjectState(process.cwd());
+  assert.equal(liveState.valid, true, `Expected valid project state, got errors: ${liveState.errors.join('; ')}`);
+  assert.equal(liveState.packageName, EXPECTED_ANDROID_PACKAGE_NAME);
+  assert.ok(liveState.versionCode >= 4);
+  assert.match(liveState.versionName, vm.SEMVER_REGEX);
+
+  assert.equal(vm.incrementSemver('1.0.3', 'patch'), '1.0.4');
+  assert.equal(vm.incrementSemver('1.0.3', 'minor'), '1.1.0');
+  assert.equal(vm.incrementSemver('1.0.3', 'major'), '2.0.0');
+  assert.throws(() => vm.parseSemver('1.0'), /Invalid SemVer/);
+
+  // Test isolated bumpVersion in temp directory without modifying workspace
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bloodqatabah-ver-'));
+  try {
+    fs.mkdirSync(path.join(tmpDir, 'android'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({ name: 'test', version: '1.0.3' }, null, 2));
+    fs.writeFileSync(path.join(tmpDir, 'android/version.properties'), 'VERSION_CODE=4\nVERSION_NAME=1.0.3\n');
+    fs.writeFileSync(
+      path.join(tmpDir, 'android/version-history.json'),
+      JSON.stringify({
+        packageName: EXPECTED_ANDROID_PACKAGE_NAME,
+        currentVersionCode: 4,
+        currentVersionName: '1.0.3',
+        history: [{ versionCode: 4, versionName: '1.0.3', recordedAt: '2026-11-23T00:00:00Z' }]
+      }, null, 2)
+    );
+
+    const bumped = vm.bumpVersion({ bumpType: 'patch', notes: 'Test patch' }, tmpDir);
+    assert.equal(bumped.versionCode, 5);
+    assert.equal(bumped.versionName, '1.0.4');
+
+    const bumpedMinor = vm.bumpVersion({ bumpType: 'minor', notes: 'Test minor' }, tmpDir);
+    assert.equal(bumpedMinor.versionCode, 6);
+    assert.equal(bumpedMinor.versionName, '1.1.0');
+
+    // Reject downgrade/duplicate versionCode & lower versionName
+    assert.throws(
+      () => vm.bumpVersion({ explicitVersionCode: 6, explicitVersionName: '1.1.1' }, tmpDir),
+      /strictly greater/
+    );
+    assert.throws(
+      () => vm.bumpVersion({ explicitVersionCode: 7, explicitVersionName: '1.0.9' }, tmpDir),
+      /strictly greater/
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Pre-download compatibility check blocks SIGNATURE_MISMATCH before downloading APK', () => {
+  const certA = '1'.repeat(64);
+  const certB = '2'.repeat(64);
+  const installed = {
+    platform: 'android',
+    packageName: EXPECTED_ANDROID_PACKAGE_NAME,
+    versionCode: 4,
+    versionName: '1.0.3',
+    sdkInt: 33,
+    signingDigests: [certA]
+  };
+
+  const baseConfig = {
+    enabled: true,
+    android: {
+      versionCode: 5,
+      versionName: '1.0.4',
+      packageName: EXPECTED_ANDROID_PACKAGE_NAME,
+      downloadUrl: VALID_HTTPS_URL,
+      sha256: VALID_SHA256,
+      signingCertSha256: certA,
+      fileSize: 12000000,
+      minSdkVersion: 24,
+      minUpgradeFromVersionCode: 1
+    },
+    web: { versionCode: 5, versionName: '1.0.4' }
+  };
+
+  const matchResult = checkUpdateCompatibility(installed, baseConfig);
+  assert.equal(matchResult.compatible, true);
+  assert.equal(matchResult.updateAvailable, true);
+
+  const mismatchResult = checkUpdateCompatibility(installed, {
+    ...baseConfig,
+    android: { ...baseConfig.android, signingCertSha256: certB }
+  });
+  assert.equal(mismatchResult.compatible, false);
+  assert.equal(mismatchResult.updateAvailable, false);
+  assert.equal(mismatchResult.reasonCode, 'SIGNATURE_MISMATCH');
+});
+
+test('Server blocks publishing release whose signingCertSha256 differs from previously published certificate', async () => {
+  const dbPath = path.resolve('data/blood_registry_db.json');
+  const originalDbBytes = fs.readFileSync(dbPath);
+  const testPort = 3201;
+  const baseUrl = `http://127.0.0.1:${testPort}`;
+
+  const serverProc = spawn('node', ['server.js', '--port', String(testPort), '--host', '127.0.0.1'], {
+    env: { ...process.env, NODE_ENV: 'production', PORT: '' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+
+  const waitForReady = async () => {
+    for (let i = 0; i < 40; i++) {
+      try {
+        const res = await fetch(`${baseUrl}/api/health`);
+        if (res.ok) return;
+      } catch {}
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error('Test server failed to become ready in time');
+  };
+
+  try {
+    await waitForReady();
+    const loginRes = await fetch(`${baseUrl}/api/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: 'alsh486iby-2026' })
+    });
+    const loginJson = await loginRes.json();
+    assert.equal(loginJson.success, true);
+
+    const certA = 'c'.repeat(64);
+    const certB = 'd'.repeat(64);
+
+    // First release signed with certA
+    const firstRes = await fetch(`${baseUrl}/api/app-update/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${loginJson.adminSessionToken}`
+      },
+      body: JSON.stringify({
+        enabled: true,
+        android: {
+          versionCode: 5,
+          versionName: '1.0.4',
+          packageName: EXPECTED_ANDROID_PACKAGE_NAME,
+          downloadUrl: VALID_HTTPS_URL,
+          sha256: VALID_SHA256,
+          signingCertSha256: certA,
+          fileSize: 15000000,
+          minSdkVersion: 24,
+          minUpgradeFromVersionCode: 1
+        },
+        web: { versionCode: 5, versionName: '1.0.4' }
+      })
+    });
+    assert.equal(firstRes.status, 200);
+
+    // Second release with mismatched certB must be blocked before users ever see it
+    const mismatchRes = await fetch(`${baseUrl}/api/app-update/config`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${loginJson.adminSessionToken}`
+      },
+      body: JSON.stringify({
+        enabled: true,
+        android: {
+          versionCode: 6,
+          versionName: '1.0.5',
+          packageName: EXPECTED_ANDROID_PACKAGE_NAME,
+          downloadUrl: VALID_HTTPS_URL,
+          sha256: 'e'.repeat(64),
+          signingCertSha256: certB,
+          fileSize: 15000000,
+          minSdkVersion: 24,
+          minUpgradeFromVersionCode: 1
+        },
+        web: { versionCode: 6, versionName: '1.0.5' }
+      })
+    });
+    assert.equal(mismatchRes.status, 400);
+    const mismatchJson = await mismatchRes.json();
+    assert.equal(mismatchJson.code, 'SIGNATURE_MISMATCH');
+  } finally {
+    serverProc.kill('SIGTERM');
+    await new Promise((r) => setTimeout(r, 300));
+    fs.writeFileSync(dbPath, originalDbBytes);
+  }
+});
+
+test('Native plugin, two-step Download->Install UI flow, and prebuild verification script checks', () => {
+  const appUpdatePlugin = fs.readFileSync(
+    path.resolve('android/app/src/main/java/org/alnasr/bloodqatabah/AppUpdatePlugin.java'),
+    'utf8'
+  );
+  const serviceContent = fs.readFileSync(path.resolve('src/services/appUpdateService.ts'), 'utf8');
+  const modalContent = fs.readFileSync(path.resolve('src/components/AppUpdateModal.tsx'), 'utf8');
+  const appContent = fs.readFileSync(path.resolve('src/App.tsx'), 'utf8');
+
+  // Native ABI, cached verified APK, pre-download signature check & install fallback
+  assert.match(appUpdatePlugin, /verifyApkZipAndAbi/);
+  assert.match(appUpdatePlugin, /INCOMPATIBLE_ABI/);
+  assert.match(appUpdatePlugin, /getDownloadedApkStatus/);
+  assert.match(appUpdatePlugin, /preserveValidNewer/);
+  assert.match(appUpdatePlugin, /ACTION_INSTALL_PACKAGE/);
+  assert.match(appUpdatePlugin, /expectedSigningCertSha256/);
+
+  // Explicit Download Update -> Ready To Install -> Install Update UX
+  assert.match(serviceContent, /downloadUpdate\(/);
+  assert.match(serviceContent, /installDownloadedUpdate\(/);
+  assert.match(serviceContent, /getDownloadedApkStatus\(/);
+  assert.match(modalContent, /تحميل التحديث/);
+  assert.match(modalContent, /تثبيت التحديث/);
+  assert.match(modalContent, /onInstallUpdate/);
+  assert.match(modalContent, /SIGNATURE_MISMATCH/);
+  assert.equal(/حذف التطبيق القديم|أزل التطبيق|uninstall/i.test(modalContent), false);
+
+  // In-app update notification banner wired cleanly
+  assert.match(appContent, /In-App Update Notification Banner/);
+  assert.match(appContent, /handleDownloadAppUpdate/);
+  assert.match(appContent, /handleInstallAppUpdate/);
+});
+
 

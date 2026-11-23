@@ -78,7 +78,7 @@ import { onAuthStateChanged } from 'firebase/auth';
 import { auth } from '../firebase/config';
 import { AdminHospitalAdsTab } from '../components/AdminHospitalAdsTab';
 import { AdminHospitalsDoctorsTab } from '../components/AdminHospitalsDoctorsTab';
-import { appUpdateService } from '../services/appUpdateService';
+import { appUpdateService, getCompiledVersionInfo } from '../services/appUpdateService';
 import { createDefaultAppUpdateConfig } from '../lib/appUpdateValidator.js';
 import { summarizeUsersDirectory, UserDirectorySummary } from '../lib/userDirectoryUtils.js';
 import { useRegisterBackHandler } from '../services/backHandlerRegistry';
@@ -307,6 +307,9 @@ export const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
   const [isLoadingAppUpdate, setIsLoadingAppUpdate] = useState(false);
   const [isSavingAppUpdate, setIsSavingAppUpdate] = useState(false);
   const [appUpdateNotice, setAppUpdateNotice] = useState<{ success: boolean; text: string } | null>(null);
+  const [showManifestImporter, setShowManifestImporter] = useState(false);
+  const [manifestImportText, setManifestImportText] = useState('');
+  const compiledAppVersion = getCompiledVersionInfo();
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
@@ -548,6 +551,62 @@ export const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
       });
     } finally {
       setIsSavingAppUpdate(false);
+    }
+  };
+
+  const handleApplyUpdateManifestJson = () => {
+    setAppUpdateNotice(null);
+    try {
+      const parsed = JSON.parse(manifestImportText.trim());
+      if (!parsed || typeof parsed !== 'object') {
+        throw new Error('صيغة JSON غير صالحة');
+      }
+      if (parsed.packageName && parsed.packageName !== 'org.alnasr.bloodqatabah') {
+        setAppUpdateNotice({
+          success: false,
+          text: `معرّف الحزمة في البيان (${parsed.packageName}) لا يطابق org.alnasr.bloodqatabah.`
+        });
+        return;
+      }
+      const vc = Number(parsed.versionCode);
+      const vn = String(parsed.versionName || '').trim();
+      const sha256 = String(parsed.sha256 || '').trim().toLowerCase();
+      const certSha256 = String(parsed.signingCertSha256 || '')
+        .replace(/:/g, '')
+        .trim()
+        .toLowerCase();
+      const fSize = Number(parsed.fileSize) || 0;
+      const minSdk = Number(parsed.minSdkVersion) || 24;
+
+      setAppUpdateConfig((prev) => ({
+        ...prev,
+        android: {
+          ...prev.android,
+          packageName: 'org.alnasr.bloodqatabah',
+          versionCode: Number.isInteger(vc) && vc > 0 ? vc : prev.android.versionCode,
+          versionName: vn || prev.android.versionName,
+          sha256: sha256 || prev.android.sha256,
+          signingCertSha256: certSha256 || prev.android.signingCertSha256 || '',
+          fileSize: fSize > 0 ? fSize : prev.android.fileSize,
+          minSdkVersion: minSdk >= 21 && minSdk <= 36 ? minSdk : prev.android.minSdkVersion
+        },
+        web: {
+          ...prev.web,
+          versionCode: Number.isInteger(vc) && vc > 0 ? vc : prev.web.versionCode,
+          versionName: vn || prev.web.versionName
+        }
+      }));
+      setShowManifestImporter(false);
+      setManifestImportText('');
+      setAppUpdateNotice({
+        success: true,
+        text: `تم استيراد بيانات الإصدار v${vn || ''} (${vc || ''}) من update-manifest.json. أدخل رابط التنزيل HTTPS ثم احفظ لنشر التحديث.`
+      });
+    } catch (err: any) {
+      setAppUpdateNotice({
+        success: false,
+        text: 'تعذر قراءة JSON من update-manifest.json: ' + (err?.message || '')
+      });
     }
   };
 
@@ -3325,26 +3384,68 @@ export const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
                   <ArrowUpCircle className="w-5 h-5" />
                 </div>
                 <div>
-                  <h4 className="font-bold text-slate-900 text-sm">
-                    إدارة تحديثات التطبيق (تحديث مباشر دون حذف النسخة)
-                  </h4>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h4 className="font-bold text-slate-900 text-sm">
+                      إدارة تحديثات التطبيق (تحديث مباشر دون حذف النسخة)
+                    </h4>
+                    <span
+                      className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700 border border-slate-200"
+                      dir="ltr"
+                    >
+                      v{compiledAppVersion.versionName} (code {compiledAppVersion.versionCode})
+                    </span>
+                  </div>
                   <p className="text-[11px] text-slate-500">
                     نشر إصدار جديد للأندرويد والويب مع التحقق من التوقيع، البصمة SHA-256، والتوافق قبل التثبيت.
                   </p>
                 </div>
               </div>
-              <label className="inline-flex items-center gap-2 cursor-pointer bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200">
-                <input
-                  type="checkbox"
-                  checked={appUpdateConfig.enabled}
-                  onChange={(e) =>
-                    setAppUpdateConfig((prev) => ({ ...prev, enabled: e.target.checked }))
-                  }
-                  className="rounded border-slate-300 text-rose-600 focus:ring-rose-500"
-                />
-                <span className="text-xs font-bold text-slate-800">تفعيل نشر التحديث للمستخدمين</span>
-              </label>
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  type="button"
+                  onClick={() => setShowManifestImporter((v) => !v)}
+                  className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 text-[11px] font-bold cursor-pointer"
+                >
+                  {showManifestImporter ? 'إغلاق المستورد' : 'استيراد من update-manifest.json'}
+                </button>
+                <label className="inline-flex items-center gap-2 cursor-pointer bg-slate-50 px-3 py-1.5 rounded-xl border border-slate-200">
+                  <input
+                    type="checkbox"
+                    checked={appUpdateConfig.enabled}
+                    onChange={(e) =>
+                      setAppUpdateConfig((prev) => ({ ...prev, enabled: e.target.checked }))
+                    }
+                    className="rounded border-slate-300 text-rose-600 focus:ring-rose-500"
+                  />
+                  <span className="text-xs font-bold text-slate-800">تفعيل نشر التحديث للمستخدمين</span>
+                </label>
+              </div>
             </div>
+
+            {showManifestImporter && (
+              <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200 space-y-2.5">
+                <label className="block text-[11px] font-bold text-slate-700">
+                  الصق محتوى ملف <span className="font-mono">update-manifest.json</span> الناتج من بناء APK لتعبئة الحقول تلقائياً:
+                </label>
+                <textarea
+                  rows={4}
+                  dir="ltr"
+                  value={manifestImportText}
+                  onChange={(e) => setManifestImportText(e.target.value)}
+                  placeholder='{"packageName":"org.alnasr.bloodqatabah","versionCode":5,"versionName":"1.0.4","sha256":"...","signingCertSha256":"...","fileSize":12345678}'
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-[11px] font-mono text-left"
+                />
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleApplyUpdateManifestJson}
+                    className="px-4 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold cursor-pointer"
+                  >
+                    تعبئة البيانات من البيان
+                  </button>
+                </div>
+              </div>
+            )}
 
             <div className="p-3 bg-amber-50 border border-amber-200 rounded-2xl text-[11px] text-amber-900 leading-relaxed space-y-1">
               <div className="font-bold flex items-center gap-1.5">
@@ -3450,7 +3551,7 @@ export const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
 
                 <div>
                   <label className="block text-[11px] font-bold text-slate-700 mb-1">
-                    بصمة التحقق SHA-256 (64 محرفاً)
+                    بصمة التحقق SHA-256 لملف APK (64 محرفاً)
                   </label>
                   <input
                     type="text"
@@ -3463,6 +3564,28 @@ export const AdminDashboardPage: React.FC<AdminDashboardPageProps> = ({
                       }))
                     }
                     placeholder="sha256 hex digest from update-manifest.json"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-[11px] font-mono text-left"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-[11px] font-bold text-slate-700 mb-1">
+                    بصمة شهادة التوقيع الرقمي SHA-256 (للفحص المسبق قبل التنزيل)
+                  </label>
+                  <input
+                    type="text"
+                    dir="ltr"
+                    value={appUpdateConfig.android.signingCertSha256 || ''}
+                    onChange={(e) =>
+                      setAppUpdateConfig((prev) => ({
+                        ...prev,
+                        android: {
+                          ...prev.android,
+                          signingCertSha256: e.target.value.replace(/:/g, '').trim().toLowerCase()
+                        }
+                      }))
+                    }
+                    placeholder="signingCertSha256 from update-manifest.json (64 hex chars)"
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-[11px] font-mono text-left"
                   />
                 </div>

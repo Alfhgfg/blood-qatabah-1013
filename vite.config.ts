@@ -9,8 +9,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function readAndroidVersionProps(): { versionCode: number; versionName: string } {
-  let versionCode = 1;
-  let versionName = '1.0';
+  let versionCode = 4;
+  let versionName = '1.0.3';
   try {
     const propsPath = path.resolve(__dirname, 'android/version.properties');
     if (fs.existsSync(propsPath)) {

@@ -152,8 +152,10 @@ jobs:
           INPUT_VERSION_NAME: ${{ github.event.inputs.version_name }}
           RUN_NUMBER: ${{ github.run_number }}
         run: |
-          BASE_VC=1
-          BASE_VN="1.0"
+          npm run version:verify
+
+          BASE_VC=4
+          BASE_VN="1.0.3"
           if [ -f "android/version.properties" ]; then
             PROP_VC=$(grep -E '^VERSION_CODE=' android/version.properties | head -n 1 | cut -d'=' -f2- | tr -d '[:space:]')
             PROP_VN=$(grep -E '^VERSION_NAME=' android/version.properties | head -n 1 | cut -d'=' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -165,28 +167,43 @@ jobs:
             fi
           fi
 
+          HISTORY_MAX_VC=0
+          if [ -f "android/version-history.json" ]; then
+            HISTORY_MAX_VC=$(node -e '
+              const fs = require("fs");
+              const h = JSON.parse(fs.readFileSync("android/version-history.json", "utf8"));
+              const max = (h.history || []).reduce((m, x) => Math.max(m, Number(x.versionCode) || 0), 0);
+              console.log(Math.max(max, Number(h.currentVersionCode) || 0));
+            ')
+          fi
+          MIN_ALLOWED_VC=$(( BASE_VC > HISTORY_MAX_VC ? BASE_VC : HISTORY_MAX_VC ))
+
           CLEAN_INPUT_VC=$(printf '%s' "${INPUT_VERSION_CODE:-}" | tr -d '[:space:]')
           if [ -n "$CLEAN_INPUT_VC" ]; then
             if ! [[ "$CLEAN_INPUT_VC" =~ ^[0-9]+$ ]] || [ "$CLEAN_INPUT_VC" -lt 1 ]; then
               echo "::error::Invalid version_code input '$CLEAN_INPUT_VC'. Must be a positive integer."
               exit 1
             fi
-            if [ "$CLEAN_INPUT_VC" -lt "$BASE_VC" ]; then
-              echo "::error::Provided version_code ($CLEAN_INPUT_VC) is lower than base VERSION_CODE ($BASE_VC) in android/version.properties. Downgrading causes 'package conflicts with an existing package'."
+            if [ "$CLEAN_INPUT_VC" -lt "$MIN_ALLOWED_VC" ]; then
+              echo "::error::Provided version_code ($CLEAN_INPUT_VC) is lower than minimum allowed ($MIN_ALLOWED_VC). Downgrading causes 'package conflicts with an existing package'."
               exit 1
             fi
             FINAL_VC="$CLEAN_INPUT_VC"
           else
-            # Monotonically increase versionCode per CI run so automatic builds never downgrade
-            FINAL_VC=$(( BASE_VC + RUN_NUMBER - 1 ))
+            # Monotonically increase versionCode per CI run so automatic builds never downgrade or repeat
+            FINAL_VC=$(( MIN_ALLOWED_VC + RUN_NUMBER - 1 ))
           fi
 
           CLEAN_INPUT_VN=$(printf '%s' "${INPUT_VERSION_NAME:-}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           FINAL_VN="${CLEAN_INPUT_VN:-$BASE_VN}"
+          if ! [[ "$FINAL_VN" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid versionName '$FINAL_VN'. Must follow SemVer MAJOR.MINOR.PATCH (e.g., 1.0.3 or 1.1.0)."
+            exit 1
+          fi
 
           echo "ANDROID_VERSION_CODE=$FINAL_VC" >> "$GITHUB_ENV"
           echo "ANDROID_VERSION_NAME=$FINAL_VN" >> "$GITHUB_ENV"
-          echo "Resolved Android version: versionCode=$FINAL_VC, versionName=$FINAL_VN (base=$BASE_VC, run_number=$RUN_NUMBER)"
+          echo "Resolved Android version: versionCode=$FINAL_VC, versionName=$FINAL_VN (base=$BASE_VC, historyMax=$HISTORY_MAX_VC, run_number=$RUN_NUMBER)"
 
       - name: Build Web Application
         run: |
@@ -346,20 +363,41 @@ jobs:
       - name: Verify Mandatory Release Signing Secrets & Pinned Certificate
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
           EXPECTED_RELEASE_CERT_SHA256: ${{ secrets.EXPECTED_RELEASE_CERT_SHA256 }}
+          RELEASE_CERT_SHA256: ${{ secrets.RELEASE_CERT_SHA256 }}
+          PINNED_RELEASE_CERT_SHA256: ${{ secrets.PINNED_RELEASE_CERT_SHA256 }}
         run: |
+          EFFECTIVE_KEYSTORE_B64="${KEYSTORE_BASE64:-${ANDROID_KEYSTORE_BASE64:-${RELEASE_KEYSTORE_BASE64:-}}}"
+          EFFECTIVE_STORE_PASS="${KEYSTORE_PASSWORD:-${ANDROID_KEYSTORE_PASSWORD:-${STORE_PASSWORD:-}}}"
+          EFFECTIVE_KEY_ALIAS="${KEY_ALIAS:-${ANDROID_KEY_ALIAS:-}}"
+          EFFECTIVE_KEY_PASS="${KEY_PASSWORD:-${ANDROID_KEY_PASSWORD:-$EFFECTIVE_STORE_PASS}}"
+          EFFECTIVE_PINNED_SHA256="${EXPECTED_RELEASE_CERT_SHA256:-${RELEASE_CERT_SHA256:-${PINNED_RELEASE_CERT_SHA256:-}}}"
+
+          EFFECTIVE_KEY_ALIAS=$(printf '%s' "$EFFECTIVE_KEY_ALIAS" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
           MISSING_SECRETS=""
-          [ -z "$KEYSTORE_BASE64" ] && MISSING_SECRETS="$MISSING_SECRETS KEYSTORE_BASE64"
-          [ -z "$KEYSTORE_PASSWORD" ] && MISSING_SECRETS="$MISSING_SECRETS KEYSTORE_PASSWORD"
-          [ -z "$KEY_ALIAS" ] && MISSING_SECRETS="$MISSING_SECRETS KEY_ALIAS"
-          [ -z "$EXPECTED_RELEASE_CERT_SHA256" ] && MISSING_SECRETS="$MISSING_SECRETS EXPECTED_RELEASE_CERT_SHA256"
+          [ -z "$EFFECTIVE_KEYSTORE_B64" ] && MISSING_SECRETS="$MISSING_SECRETS KEYSTORE_BASE64"
+          [ -z "$EFFECTIVE_STORE_PASS" ] && MISSING_SECRETS="$MISSING_SECRETS KEYSTORE_PASSWORD"
+          [ -z "$EFFECTIVE_KEY_ALIAS" ] && MISSING_SECRETS="$MISSING_SECRETS KEY_ALIAS"
+          [ -z "$EFFECTIVE_PINNED_SHA256" ] && MISSING_SECRETS="$MISSING_SECRETS EXPECTED_RELEASE_CERT_SHA256"
 
           if [ -n "$MISSING_SECRETS" ]; then
             echo "::error::Release build aborted! Missing required GitHub Secret(s):${MISSING_SECRETS}."
             echo "::error::Debug keystore fallback and replacement key generation are strictly disabled to prevent INSTALL_FAILED_UPDATE_INCOMPATIBLE."
+            echo "Configure the 4 original release signing secrets in GitHub Settings -> Secrets and variables -> Actions:"
+            echo "  - KEYSTORE_BASE64 (base64 of the original .jks/.keystore file)"
+            echo "  - KEYSTORE_PASSWORD"
+            echo "  - KEY_ALIAS"
+            echo "  - EXPECTED_RELEASE_CERT_SHA256"
             echo "If you need EXPECTED_RELEASE_CERT_SHA256 from the currently installed APK on a phone, run:"
             echo "  adb shell pm path org.alnasr.bloodqatabah"
             echo "  adb pull /data/app/.../base.apk old-installed.apk"
@@ -367,47 +405,130 @@ jobs:
             exit 1
           fi
 
-          NORM_PINNED=$(printf '%s' "$EXPECTED_RELEASE_CERT_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
+          echo "::add-mask::$EFFECTIVE_STORE_PASS"
+          echo "::add-mask::$EFFECTIVE_KEY_ALIAS"
+          echo "::add-mask::$EFFECTIVE_KEY_PASS"
+
+          NORM_PINNED=$(printf '%s' "$EFFECTIVE_PINNED_SHA256" | sed -E 's/^[[:space:]]*(Signer #[0-9]+ certificate SHA-256 digest:|SHA-?256:)[[:space:]]*//I' | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
           if ! [[ "$NORM_PINNED" =~ ^[0-9a-f]{64}$ ]]; then
             echo "::error::Invalid EXPECTED_RELEASE_CERT_SHA256 format! Expected a 64-character hex SHA-256 fingerprint (with or without colons)."
             exit 1
           fi
 
-          EFFECTIVE_KEY_PASSWORD="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
-          printf '%s' "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 --decode > android/app/release.keystore
-          if [ ! -s android/app/release.keystore ]; then
-            echo "::error::Decoded release.keystore is empty or invalid base64!"
+          export EFFECTIVE_KEYSTORE_B64
+          node -e '
+            const fs = require("fs");
+            let raw = String(process.env.EFFECTIVE_KEYSTORE_B64 || "").replace(/^\uFEFF/, "").trim();
+            raw = raw.replace(/^data:[^;]+;base64,/i, "");
+            let b64 = raw.replace(/[\r\n\s]+/g, "").replace(/-/g, "+").replace(/_/g, "/");
+            const pad = b64.length % 4;
+            if (pad === 2) b64 += "==";
+            else if (pad === 3) b64 += "=";
+            else if (pad === 1 || b64.length === 0) {
+              console.error("::error::KEYSTORE_BASE64 has invalid Base64 length!");
+              process.exit(1);
+            }
+            const buf = Buffer.from(b64, "base64");
+            if (!buf || buf.length < 32) {
+              console.error("::error::Decoded release.keystore is empty or too small to be a valid keystore!");
+              process.exit(1);
+            }
+            fs.writeFileSync("android/app/release.keystore", buf, { mode: 0o600 });
+          '
+
+          VERIFY_DIR=$(mktemp -d)
+          VERIFY_JAVA="${VERIFY_DIR}/VerifyReleaseKeystore.java"
+          trap 'rm -rf "$VERIFY_DIR"' EXIT
+          cat << 'EOF_JAVA' > "$VERIFY_JAVA"
+          import java.io.File;
+          import java.security.Key;
+          import java.security.KeyStore;
+          import java.security.MessageDigest;
+          import java.security.cert.Certificate;
+          import java.util.Collections;
+
+          public class VerifyReleaseKeystore {
+              public static void main(String[] args) throws Exception {
+                  String keystorePath = args[0];
+                  String storePass = System.getenv("EFFECTIVE_STORE_PASS");
+                  String alias = System.getenv("EFFECTIVE_KEY_ALIAS");
+                  String keyPass = System.getenv("EFFECTIVE_KEY_PASS");
+
+                  KeyStore ks = KeyStore.getInstance(new File(keystorePath), storePass.toCharArray());
+                  if (!ks.containsAlias(alias)) {
+                      System.err.println("::error::Key alias '" + alias + "' not found in release.keystore! Available aliases: " + Collections.list(ks.aliases()));
+                      System.exit(1);
+                  }
+                  if (!ks.isKeyEntry(alias)) {
+                      System.err.println("::error::Alias '" + alias + "' exists in release.keystore but is not a PrivateKeyEntry!");
+                      System.exit(1);
+                  }
+                  Key key = ks.getKey(alias, keyPass.toCharArray());
+                  if (key == null) {
+                      System.err.println("::error::Could not recover private key for alias '" + alias + "'! Check KEY_PASSWORD / KEYSTORE_PASSWORD.");
+                      System.exit(1);
+                  }
+                  Certificate cert = ks.getCertificate(alias);
+                  if (cert == null) {
+                      System.err.println("::error::No certificate found for alias '" + alias + "'!");
+                      System.exit(1);
+                  }
+                  byte[] encoded = cert.getEncoded();
+                  System.out.println("SHA256=" + hexDigest("SHA-256", encoded));
+                  System.out.println("SHA1=" + hexDigest("SHA-1", encoded));
+              }
+
+              private static String hexDigest(String algo, byte[] data) throws Exception {
+                  byte[] digest = MessageDigest.getInstance(algo).digest(data);
+                  StringBuilder sb = new StringBuilder(digest.length * 2);
+                  for (byte b : digest) {
+                      sb.append(String.format("%02x", b & 0xff));
+                  }
+                  return sb.toString();
+              }
+          }
+          EOF_JAVA
+
+          export EFFECTIVE_STORE_PASS EFFECTIVE_KEY_ALIAS EFFECTIVE_KEY_PASS
+          if ! KEYSTORE_CHECK_OUT=$(java "$VERIFY_JAVA" android/app/release.keystore); then
+            echo "::error::Failed to verify release.keystore with provided KEYSTORE_PASSWORD, KEY_ALIAS, and KEY_PASSWORD!"
             rm -f android/app/release.keystore
             exit 1
           fi
 
-          if ! keytool -list -keystore android/app/release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
-            echo "::error::Failed to verify release.keystore with provided KEYSTORE_PASSWORD and KEY_ALIAS!"
+          NORM_KEYSTORE=$(printf '%s\n' "$KEYSTORE_CHECK_OUT" | awk -F'=' '/^SHA256=/{print $2}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          NORM_KEYSTORE_SHA1=$(printf '%s\n' "$KEYSTORE_CHECK_OUT" | awk -F'=' '/^SHA1=/{print $2}' | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+          if ! [[ "$NORM_KEYSTORE" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not extract valid SHA-256 certificate fingerprint from release.keystore!"
             rm -f android/app/release.keystore
             exit 1
           fi
 
-          CERT_SHA256=$(keytool -list -v -keystore android/app/release.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" 2>/dev/null | grep -iE "SHA256:|SHA-256:" | head -n 1 | sed -E 's/.*SHA-?256:[[:space:]]*//' | tr -d '[:space:]')
-          if [ -z "$CERT_SHA256" ]; then
-            echo "::error::Could not extract SHA-256 certificate fingerprint from release.keystore!"
-            rm -f android/app/release.keystore
-            exit 1
-          fi
-
-          NORM_KEYSTORE=$(printf '%s' "$CERT_SHA256" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
           if [ "$NORM_PINNED" != "$NORM_KEYSTORE" ]; then
             echo "::error::Release keystore SHA-256 ($NORM_KEYSTORE) does not match pinned EXPECTED_RELEASE_CERT_SHA256 ($NORM_PINNED)! Aborting build to prevent INSTALL_FAILED_UPDATE_INCOMPATIBLE."
             rm -f android/app/release.keystore
             exit 1
           fi
 
-          echo "ANDROID_KEYSTORE_FILE=release.keystore" >> "$GITHUB_ENV"
-          echo "ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
-          echo "ANDROID_KEY_PASSWORD=$EFFECTIVE_KEY_PASSWORD" >> "$GITHUB_ENV"
-          echo "SIGNING_CERT_SHA256=$NORM_KEYSTORE" >> "$GITHUB_ENV"
-          echo "PINNED_CERT_SHA256=$NORM_PINNED" >> "$GITHUB_ENV"
+          LC_ALL=C keytool -list -keystore android/app/release.keystore -storepass "$EFFECTIVE_STORE_PASS" -alias "$EFFECTIVE_KEY_ALIAS" >/dev/null
+
+          DELIM="__GH_ENV_DELIM_${RANDOM}_${RANDOM}__"
+          {
+            printf 'ANDROID_KEYSTORE_FILE=release.keystore\n'
+            printf 'ANDROID_KEYSTORE_PASSWORD<<%s\n%s\n%s\n' "$DELIM" "$EFFECTIVE_STORE_PASS" "$DELIM"
+            printf 'ANDROID_KEY_ALIAS<<%s\n%s\n%s\n' "$DELIM" "$EFFECTIVE_KEY_ALIAS" "$DELIM"
+            printf 'ANDROID_KEY_PASSWORD<<%s\n%s\n%s\n' "$DELIM" "$EFFECTIVE_KEY_PASS" "$DELIM"
+            printf 'SIGNING_CERT_SHA256=%s\n' "$NORM_KEYSTORE"
+            printf 'SIGNING_CERT_SHA1=%s\n' "$NORM_KEYSTORE_SHA1"
+            printf 'PINNED_CERT_SHA256=%s\n' "$NORM_PINNED"
+          } >> "$GITHUB_ENV"
+
           echo "Release keystore verified and matched pinned certificate SHA-256: ${NORM_KEYSTORE}"
+          echo "Release keystore certificate SHA-1 (for Firebase Android App): ${NORM_KEYSTORE_SHA1}"
+
+      - name: Run Pre-Build Identity, Version & Signing Verification
+        run: |
+          node scripts/verify-android-release.mjs --mode prebuild --pinned-sha256 "$PINNED_CERT_SHA256"
 
       - name: Build Signed Android Release AAB & APK
         working-directory: android
@@ -434,7 +555,7 @@ jobs:
             exit 1
           fi
 
-          AAB_CERT_RAW=$(keytool -printcert -jarfile "$AAB_FILE" 2>/dev/null | grep -iE "SHA256:|SHA-256:" | head -n 1 | sed -E 's/.*SHA-?256:[[:space:]]*//' | tr -d '[:space:]')
+          AAB_CERT_RAW=$(LC_ALL=C keytool -printcert -jarfile "$AAB_FILE" 2>/dev/null | grep -iE "SHA256:|SHA-256:" | head -n 1 | sed -E 's/.*SHA-?256:[[:space:]]*//' | tr -d '[:space:]')
           NORM_AAB_CERT=$(printf '%s' "$AAB_CERT_RAW" | tr -d ':[:space:]' | tr '[:upper:]' '[:lower:]')
           if [ -z "$NORM_AAB_CERT" ] || [ "$NORM_AAB_CERT" != "$PINNED_CERT_SHA256" ]; then
             echo "::error::AAB certificate mismatch! Expected pinned $PINNED_CERT_SHA256, got '${NORM_AAB_CERT:-empty}'."
@@ -481,27 +602,21 @@ jobs:
               echo "::error::APK versionCode mismatch! Expected ${ANDROID_VERSION_CODE}, got: $BADGING"
               exit 1
             fi
+            if ! printf '%s' "$BADGING" | grep -q "versionName='${ANDROID_VERSION_NAME}'"; then
+              echo "::error::APK versionName mismatch! Expected ${ANDROID_VERSION_NAME}, got: $BADGING"
+              exit 1
+            fi
           fi
 
           cp "$RELEASE_APK" build-artifacts/apk/app-release.apk
+          node scripts/verify-android-release.mjs \
+            --mode postbuild \
+            --apk build-artifacts/apk/app-release.apk \
+            --expected-version-code "$ANDROID_VERSION_CODE" \
+            --expected-version-name "$ANDROID_VERSION_NAME" \
+            --pinned-sha256 "$PINNED_CERT_SHA256" \
+            --manifest-out build-artifacts/apk/update-manifest.json
           APK_SHA256=$(sha256sum build-artifacts/apk/app-release.apk | awk '{print $1}')
-          APK_SIZE=$(stat -c%s build-artifacts/apk/app-release.apk)
-
-          cat << EOF > build-artifacts/apk/update-manifest.json
-          {
-            "packageName": "org.alnasr.bloodqatabah",
-            "apkFileName": "app-release.apk",
-            "versionCode": ${ANDROID_VERSION_CODE},
-            "versionName": "${ANDROID_VERSION_NAME}",
-            "sha256": "${APK_SHA256}",
-            "signingMode": "release",
-            "releaseSigned": true,
-            "signingCertSha256": "${APK_CERT_SHA256}",
-            "fileSize": ${APK_SIZE},
-            "minSdkVersion": 24,
-            "generatedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          }
-          EOF
 
           {
             echo "## Android Release Build Verified"
@@ -510,6 +625,7 @@ jobs:
             echo "- **Version**: \`${ANDROID_VERSION_NAME}\` (\`versionCode=${ANDROID_VERSION_CODE}\`)"
             echo "- **Signing Mode**: \`release\` (Strict Pinned Keystore)"
             echo "- **Pinned Certificate SHA-256**: \`${APK_CERT_SHA256}\`"
+            echo "- **Certificate SHA-1 (Firebase)**: \`${SIGNING_CERT_SHA1}\`"
             echo "- **APK SHA-256**: \`${APK_SHA256}\`"
             echo "- **In-Place Update Test**: \`adb install -r app-release.apk\`"
           } >> "$GITHUB_STEP_SUMMARY"

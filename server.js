@@ -766,6 +766,7 @@ function parseDbContent(content) {
       hospitals: Array.isArray(parsed.hospitals) ? parsed.hospitals : [],
       doctors: Array.isArray(parsed.doctors) ? parsed.doctors : [],
       appUpdate: sanitizeLoadedAppUpdateConfig(parsed.appUpdate),
+      appUpdateHistory: Array.isArray(parsed.appUpdateHistory) ? parsed.appUpdateHistory : [],
       users: Array.isArray(parsed.users) && parsed.users.length > 0 ? parsed.users : [
         {
           id: "user-admin",
@@ -866,6 +867,7 @@ function loadDatabase() {
     hospitals: [],
     doctors: [],
     appUpdate: createDefaultAppUpdateConfig(),
+    appUpdateHistory: [],
     users: [
       {
         id: "user-admin",
@@ -3521,27 +3523,76 @@ app.post("/api/app-update/config", requireAdminAuth, async (req, res) => {
     }
 
     const currentConfig = db2.appUpdate;
-    if (currentConfig && currentConfig.enabled && validation.config.enabled && currentConfig.android) {
-      const currentVc = Number(currentConfig.android.versionCode || 0);
-      const nextVc = Number(validation.config.android.versionCode || 0);
-      if (nextVc < currentVc) {
+    const historyList = Array.isArray(db2.appUpdateHistory) ? db2.appUpdateHistory : [];
+    const nextVc = Number(validation.config.android.versionCode || 0);
+    const nextSha = String(validation.config.android.sha256 || "").toLowerCase();
+    const nextCert = String(validation.config.android.signingCertSha256 || "").toLowerCase();
+    const pinnedEnvCert = String(process.env.EXPECTED_RELEASE_CERT_SHA256 || "").replace(/:/g, "").trim().toLowerCase();
+
+    if (validation.config.enabled) {
+      if (pinnedEnvCert && nextCert && nextCert !== pinnedEnvCert) {
+        return res.status(400).json({
+          success: false,
+          code: "SIGNATURE_MISMATCH",
+          error: "شهادة التوقيع الرقمي (signingCertSha256) لا تطابق الشهادة الأصلية المعتمدة للتطبيق. تم إيقاف نشر التحديث لحماية المستخدمين من مطالبتهم بحذف النسخة الحالية."
+        });
+      }
+
+      const previousSignedEntry =
+        (currentConfig?.android?.signingCertSha256 && currentConfig.android.signingCertSha256.toLowerCase()) ||
+        historyList.find((h) => h && h.signingCertSha256)?.signingCertSha256?.toLowerCase() ||
+        "";
+      if (previousSignedEntry && nextCert && nextCert !== previousSignedEntry) {
+        return res.status(400).json({
+          success: false,
+          code: "SIGNATURE_MISMATCH",
+          error: "شهادة التوقيع الرقمي لهذا التحديث تختلف عن شهادة الإصدار السابق! يجب توقيع التحديث بنفس الـ Keystore الأصلي."
+        });
+      }
+
+      const maxPublishedVc = Math.max(
+        currentConfig && currentConfig.enabled && currentConfig.android ? Number(currentConfig.android.versionCode || 0) : 0,
+        ...historyList.map((h) => Number(h?.versionCode || 0))
+      );
+
+      if (maxPublishedVc > 0 && nextVc < maxPublishedVc) {
         return res.status(400).json({
           success: false,
           code: "VERSION_DOWNGRADE_FORBIDDEN",
-          error: `لا يمكن تخفيض رقم الإصدار (${nextVc}) عن الإصدار المنشور حالياً (${currentVc}) لضمان التحديث المباشر.`
+          error: `لا يمكن تخفيض رقم الإصدار (${nextVc}) عن الإصدار المنشور حالياً (${maxPublishedVc}) لضمان التحديث المباشر.`
         });
       }
+
+      const conflictingHistory = historyList.find(
+        (h) => Number(h?.versionCode) === nextVc && h?.sha256 && nextSha && String(h.sha256).toLowerCase() !== nextSha
+      );
       if (
-        nextVc === currentVc &&
-        currentConfig.android.sha256 &&
-        validation.config.android.sha256 &&
-        currentConfig.android.sha256.toLowerCase() !== validation.config.android.sha256.toLowerCase()
+        conflictingHistory ||
+        (currentConfig &&
+          currentConfig.enabled &&
+          currentConfig.android &&
+          nextVc === Number(currentConfig.android.versionCode || 0) &&
+          currentConfig.android.sha256 &&
+          nextSha &&
+          currentConfig.android.sha256.toLowerCase() !== nextSha)
       ) {
         return res.status(400).json({
           success: false,
           code: "DUPLICATE_VERSION_CODE",
           error: `رقم الإصدار (${nextVc}) مستخدم مسبقاً لحزمة APK أخرى. يجب زيادة versionCode لكل إصدار جديد.`
         });
+      }
+
+      if (!historyList.some((h) => Number(h?.versionCode) === nextVc && String(h?.sha256 || "").toLowerCase() === nextSha)) {
+        historyList.push({
+          versionCode: nextVc,
+          versionName: validation.config.android.versionName,
+          sha256: nextSha,
+          signingCertSha256: nextCert,
+          publishedAt: (/* @__PURE__ */ new Date()).toISOString(),
+          publishedBy: actor
+        });
+        db2.appUpdateHistory = historyList;
       }
     }
 
