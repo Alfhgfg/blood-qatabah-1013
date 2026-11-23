@@ -1353,16 +1353,16 @@
       "minUpgradeFromVersionCode": 1,
       "mandatory": false,
       "releaseNotes": "",
-      "releasedAt": "2026-11-23T20:27:21.784Z"
+      "releasedAt": "2026-11-23T20:51:00.525Z"
     },
     "web": {
       "versionCode": 5,
       "versionName": "1.0.4",
       "mandatory": false,
       "releaseNotes": "",
-      "releasedAt": "2026-11-23T20:27:21.784Z"
+      "releasedAt": "2026-11-23T20:51:00.525Z"
     },
-    "updatedAt": "2026-11-23T20:27:21.784Z",
+    "updatedAt": "2026-11-23T20:51:00.525Z",
     "updatedBy": "admin"
   },
   "appUpdateHistory": [
@@ -1371,7 +1371,7 @@
       "versionName": "1.0.4",
       "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "signingCertSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-      "publishedAt": "2026-11-23T20:27:21.784Z",
+      "publishedAt": "2026-11-23T20:51:00.525Z",
       "publishedBy": "admin"
     }
   ],
@@ -1386,7 +1386,7 @@
       "passwordHash": "0ffa41d39b4d4e70e376d592843d41e94a71d1593aa961f31dbc278ecbc56992",
       "password": "alsh486iby-2026",
       "lastLoginAt": "2026-11-02T18:54:27.715Z",
-      "updatedAt": "2026-11-23T20:19:00.635Z"
+      "updatedAt": "2026-11-23T20:28:17.875Z"
     },
     {
       "id": "user-default",

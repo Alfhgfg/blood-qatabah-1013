@@ -636,15 +636,23 @@ test('Native plugin, two-step Download->Install UI flow, and prebuild verificati
     path.resolve('android/app/src/main/java/org/alnasr/bloodqatabah/AppUpdatePlugin.java'),
     'utf8'
   );
+  const manifestXml = fs.readFileSync(
+    path.resolve('android/app/src/main/AndroidManifest.xml'),
+    'utf8'
+  );
   const serviceContent = fs.readFileSync(path.resolve('src/services/appUpdateService.ts'), 'utf8');
   const modalContent = fs.readFileSync(path.resolve('src/components/AppUpdateModal.tsx'), 'utf8');
   const appContent = fs.readFileSync(path.resolve('src/App.tsx'), 'utf8');
 
   // Native ABI, cached verified APK, pre-download signature check & install fallback
+  assert.match(manifestXml, /android\.intent\.action\.VIEW/);
+  assert.match(manifestXml, /application\/vnd\.android\.package-archive/);
+  assert.match(manifestXml, /REQUEST_INSTALL_PACKAGES/);
   assert.match(appUpdatePlugin, /verifyApkZipAndAbi/);
   assert.match(appUpdatePlugin, /INCOMPATIBLE_ABI/);
   assert.match(appUpdatePlugin, /getDownloadedApkStatus/);
   assert.match(appUpdatePlugin, /preserveValidNewer/);
+  assert.match(appUpdatePlugin, /ActivityNotFoundException/);
   assert.match(appUpdatePlugin, /ACTION_INSTALL_PACKAGE/);
   assert.match(appUpdatePlugin, /expectedSigningCertSha256/);
 

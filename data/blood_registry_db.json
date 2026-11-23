@@ -1347,6 +1347,7 @@
       "packageName": "org.alnasr.bloodqatabah",
       "downloadUrl": "",
       "sha256": "",
+      "signingCertSha256": "",
       "fileSize": 0,
       "minSdkVersion": 24,
       "minUpgradeFromVersionCode": 1,
@@ -1364,6 +1365,7 @@
     "updatedAt": "2026-10-01T00:00:00Z",
     "updatedBy": "system"
   },
+  "appUpdateHistory": [],
   "users": [
     {
       "id": "user-admin",
@@ -1375,7 +1377,7 @@
       "passwordHash": "0ffa41d39b4d4e70e376d592843d41e94a71d1593aa961f31dbc278ecbc56992",
       "password": "alsh486iby-2026",
       "lastLoginAt": "2026-11-02T18:54:27.715Z",
-      "updatedAt": "2026-11-23T20:19:00.635Z"
+      "updatedAt": "2026-11-23T20:28:17.875Z"
     },
     {
       "id": "user-default",

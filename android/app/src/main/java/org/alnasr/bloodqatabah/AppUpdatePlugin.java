@@ -1,5 +1,6 @@
 package org.alnasr.bloodqatabah;
 
+import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
@@ -504,7 +505,9 @@ public class AppUpdatePlugin extends Plugin {
             installIntent.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
             installIntent.putExtra(Intent.EXTRA_RETURN_RESULT, false);
 
-            if (installIntent.resolveActivity(context.getPackageManager()) == null) {
+            try {
+                context.startActivity(installIntent);
+            } catch (ActivityNotFoundException ex) {
                 @SuppressWarnings("deprecation")
                 Intent fallbackIntent = new Intent(Intent.ACTION_INSTALL_PACKAGE);
                 fallbackIntent.setData(apkUri);
@@ -512,8 +515,6 @@ public class AppUpdatePlugin extends Plugin {
                 fallbackIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 fallbackIntent.putExtra(Intent.EXTRA_NOT_UNKNOWN_SOURCE, true);
                 context.startActivity(fallbackIntent);
-            } else {
-                context.startActivity(installIntent);
             }
 
             JSObject ret = new JSObject();
